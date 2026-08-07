@@ -59,6 +59,7 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.foundation.border
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.asImageBitmap
@@ -187,18 +188,29 @@ fun MeasureScreen(
                                         .onSizeChanged { overlaySize = it }
                                         .pointerInput(
                                             isSize,
+                                            uiState.mode,
                                             uiState.detectedObjects.size,
+                                            uiState.selectedObjectIndex,
                                             uiState.overlayRotationDegrees
                                         ) {
-                                            if (!isSize) return@pointerInput
                                             detectTapGestures { offset ->
-                                                viewModel.onObjectSelected(
-                                                    tapX = offset.x,
-                                                    tapY = offset.y,
-                                                    viewWidth = overlaySize.width,
-                                                    viewHeight = overlaySize.height,
-                                                    rotationDegrees = uiState.overlayRotationDegrees
-                                                )
+                                                if (isSize) {
+                                                    viewModel.onObjectSelected(
+                                                        tapX = offset.x,
+                                                        tapY = offset.y,
+                                                        viewWidth = overlaySize.width,
+                                                        viewHeight = overlaySize.height,
+                                                        rotationDegrees = uiState.overlayRotationDegrees
+                                                    )
+                                                } else {
+                                                    viewModel.selectSpeedObject(
+                                                        tapX = offset.x,
+                                                        tapY = offset.y,
+                                                        viewWidth = overlaySize.width,
+                                                        viewHeight = overlaySize.height,
+                                                        rotationDegrees = uiState.overlayRotationDegrees
+                                                    )
+                                                }
                                             }
                                         }
                                 )
@@ -518,17 +530,21 @@ private fun SpeedControls(uiState: MeasureUiState, viewModel: MeasureViewModel) 
 
     if (uiState.isCameraRunning && !uiState.isTracking) {
         Text(
-            text = "Steady the phone — auto-tracks a moving object shortly",
+            text = "Tap an object to measure its speed, or wait to auto-track",
             style = MaterialTheme.typography.bodyMedium,
             color = Color(0xFFAAAAAA)
         )
     } else if (uiState.isTracking) {
         val movingCount = uiState.detectedObjects.count { it.isMoving }
+        val pinned = uiState.selectedObjectIndex >= 0
         Text(
-            text = if (movingCount > 1) "Tracking $movingCount moving objects..."
-                     else "Tracking moving object...",
+            text = when {
+                pinned -> "Pinned — measuring selected object. Tap again to release."
+                movingCount > 1 -> "Tracking $movingCount moving objects..."
+                else -> "Tracking moving object..."
+            },
             style = MaterialTheme.typography.bodyMedium,
-            color = Color(0xFF69F0AE)
+            color = if (pinned) Color(0xFFFFD54F) else Color(0xFF69F0AE)
         )
     } else if (!uiState.isCameraRunning) {
         Text(
@@ -734,18 +750,28 @@ private fun SpeedObjectLabels(
                 if (center != null) {
                     val dpX = (center.first / density).dp
                     val dpY = (center.second / density).dp
+                    // The user-pinned object gets an amber ring + "PINNED" tag so
+                    // it stands out from auto-tracked objects.
+                    val isPinned = obj.contourIndex == viewModel.uiState.value.selectedObjectIndex
+                    val labelColor = if (isPinned) Color(0xFFFFD54F) else Color(0xFF69F0AE)
+                    val tag = if (isPinned) "★ " else ""
                     Box(
                         modifier = Modifier
                             .offset(x = dpX, y = dpY)
                             .background(
-                                Color.Black.copy(alpha = 0.65f),
+                                Color.Black.copy(alpha = if (isPinned) 0.8f else 0.65f),
                                 RoundedCornerShape(6.dp)
+                            )
+                            .then(
+                                if (isPinned) Modifier.border(
+                                    1.dp, Color(0xFFFFD54F), RoundedCornerShape(6.dp)
+                                ) else Modifier
                             )
                             .padding(horizontal = 6.dp, vertical = 2.dp)
                     ) {
                         Text(
-                            text = "${"%.0f".format(obj.speed)} px/s",
-                            color = Color(0xFF69F0AE),
+                            text = "$tag${"%.0f".format(obj.speed)} px/s",
+                            color = labelColor,
                             fontWeight = FontWeight.Bold,
                             fontSize = 12.sp
                         )

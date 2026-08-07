@@ -128,6 +128,14 @@ class MeasureViewModel @Inject constructor(
     /** Monotonic id source for new tracks. */
     private var nextTrackId: Int = 0
 
+    /**
+     * Stable id of the track the user tapped to pin for speed tracking (-1 = none).
+     * Keyed on the stable track id rather than the frame-local contour index,
+     * which can be reassigned between frames. A pinned track keeps measuring its
+     * object's speed even when it momentarily stops, so long as it stays in frame.
+     */
+    private var pinnedTrackId: Int = -1
+
     /** When the first object in the current tracking burst started moving. */
     private var trackingStartTimeMs: Long = 0L
 
@@ -138,6 +146,10 @@ class MeasureViewModel @Inject constructor(
     /** Switch between Size and Speed measurement. Stops the camera if running. */
     fun selectMode(mode: MeasureMode) {
         if (mode == _uiState.value.mode) return
+        // Clear speed tracking state on any mode switch — tracks and the user pin
+        // are specific to SPEED mode and must not leak into SIZE mode.
+        trackedObjects.clear()
+        pinnedTrackId = -1
         if (_uiState.value.isCameraRunning) stopCamera()
         cameraManager.measureMode = mode
         _uiState.update {
@@ -191,6 +203,7 @@ class MeasureViewModel @Inject constructor(
         processingCollectionJob?.cancel()
         processingCollectionJob = null
         prevObjects = emptyList()
+        pinnedTrackId = -1
         cameraStartedAtMs = 0L
         _uiState.update {
             it.copy(
@@ -388,6 +401,105 @@ class MeasureViewModel @Inject constructor(
         }
     }
 
+    /**
+     * Handle a tap on the camera preview in SPEED mode: pin the nearest object so
+     * its speed is tracked and shown on demand. Tapping the same object again (or
+     * empty space) clears the pin. The pinned object keeps a live track even when
+     * it momentarily stops moving, so long as it stays in frame.
+     */
+    fun selectSpeedObject(
+        tapX: Float,
+        tapY: Float,
+        viewWidth: Int,
+        viewHeight: Int,
+        rotationDegrees: Int = 0
+    ) {
+        if (_uiState.value.mode != MeasureMode.SPEED) return
+        val state = _uiState.value
+        if (state.detectedObjects.isEmpty() || state.frameWidth == 0 || state.frameHeight == 0) return
+
+        val (frameX, frameY) = viewTapToFrame(
+            tapX = tapX,
+            tapY = tapY,
+            viewWidth = viewWidth,
+            viewHeight = viewHeight,
+            frameWidth = state.frameWidth,
+            frameHeight = state.frameHeight,
+            rotationDegrees = rotationDegrees
+        ) ?: return
+
+        var closestIndex = -1
+        var closestDistance = Double.MAX_VALUE
+
+        state.detectedObjects.forEach { obj ->
+            val dx = frameX - obj.centerX
+            val dy = frameY - obj.centerY
+            val dist = kotlin.math.sqrt((dx * dx + dy * dy).toDouble())
+            val maxDim = kotlin.math.max(obj.pixelWidth, obj.pixelHeight)
+            if (dist < maxDim && dist < closestDistance) {
+                closestDistance = dist
+                closestIndex = obj.contourIndex
+            }
+        }
+
+        val pinnedTrack = trackedObjects[pinnedTrackId]
+
+        // Toggle: tapping the currently-pinned object again clears it.
+        if (closestIndex >= 0 && pinnedTrack != null && pinnedTrack.contourIndex == closestIndex) {
+            trackedObjects.remove(pinnedTrackId)
+            pinnedTrackId = -1
+            _uiState.update { it.copy(selectedObjectIndex = -1) }
+            return
+        }
+
+        // Drop any previous pin before setting the new one.
+        if (pinnedTrack != null) {
+            trackedObjects.remove(pinnedTrackId)
+        }
+
+        if (closestIndex >= 0) {
+            // Ensure a live track exists for the pinned object so its speed is
+            // measured even if it isn't currently moving enough to auto-track.
+            val id = ensurePinnedTrack(state.detectedObjects, closestIndex)
+            pinnedTrackId = id
+            _uiState.update { it.copy(selectedObjectIndex = closestIndex) }
+        } else {
+            // Tapped empty space — clear the pin.
+            pinnedTrackId = -1
+            _uiState.update { it.copy(selectedObjectIndex = -1) }
+        }
+    }
+
+    /**
+     * Guarantee a live track exists for [contourIndex], seeding it from the
+     * matching detected object. Returns the track's stable id (existing or new).
+     * If no matching object is found, returns -1 and leaves tracking unchanged.
+     */
+    private fun ensurePinnedTrack(
+        detectedObjects: List<MeasureDetectedObject>,
+        contourIndex: Int
+    ): Int {
+        val existing = trackedObjects.entries
+            .firstOrNull { it.value.contourIndex == contourIndex }?.key
+        if (existing != null) return existing
+
+        val obj = detectedObjects.firstOrNull { it.contourIndex == contourIndex } ?: return -1
+        val now = System.currentTimeMillis()
+        if (trackedObjects.isEmpty()) trackingStartTimeMs = now
+        val id = nextTrackId++
+        trackedObjects[id] = TrackedObject(
+            id = id,
+            contourIndex = contourIndex,
+            // MeasureDetectedObject center is in raw-frame pixels as Float.
+            lastPosition = org.opencv.core.Point(obj.centerX.toDouble(), obj.centerY.toDouble()),
+            smoothedSpeed = 0.0,
+            lastFrameTimeMs = now,
+            lastMovementTimeMs = now,
+            totalDistance = 0.0
+        )
+        return id
+    }
+
     fun setCalibration(knownLengthMm: Double) {
         val pixelX = _uiState.value.selectedPixelX ?: return
         if (knownLengthMm <= 0 || pixelX <= 0) return
@@ -540,10 +652,13 @@ class MeasureViewModel @Inject constructor(
         }
 
         // Tracks not matched to a moving object: follow the object if it's still
-        // nearby (so the label sticks to it), otherwise let it time out.
+        // nearby (so the label sticks to it), otherwise let it time out — except
+        // for a pinned track, which the user explicitly selected and which must
+        // persist (and keep following) until cleared.
         val stale = mutableListOf<Int>()
         for ((id, track) in trackedObjects) {
             if (id in matchedTrackIds) continue
+            val isPinned = id == pinnedTrackId
             val nearest = currentObjects.minByOrNull {
                 distance(track.lastPosition.x, track.lastPosition.y, it.center.x, it.center.y)
             }
@@ -554,16 +669,21 @@ class MeasureViewModel @Inject constructor(
                 // Still present but below motion threshold — follow without gaining speed.
                 track.contourIndex = nearest!!.contourIndex
                 track.lastPosition = nearest.center
-                track.smoothedSpeed = 0.0
+                if (!isPinned) {
+                    track.smoothedSpeed = 0.0
+                }
             }
-            if (now - track.lastMovementTimeMs > SPEED_RESET_TIMEOUT_MS) {
+            // A pinned track never times out and keeps its last known speed so the
+            // readout stays live even while the object is momentarily still.
+            if (!isPinned && now - track.lastMovementTimeMs > SPEED_RESET_TIMEOUT_MS) {
                 stale.add(id)
             }
         }
         stale.forEach { trackedObjects.remove(it) }
 
-        // Highlight the fastest currently-moving object in the contour overlay.
-        val primary = trackedObjects.values.maxByOrNull { it.smoothedSpeed }
+        // Prefer the pinned object for the contour highlight; otherwise the fastest.
+        val primary = trackedObjects[pinnedTrackId]
+            ?: trackedObjects.values.maxByOrNull { it.smoothedSpeed }
         cameraManager.setTargetContourIndex(primary?.contourIndex ?: -1)
     }
 
@@ -644,13 +764,17 @@ class MeasureViewModel @Inject constructor(
     fun stopTracking() {
         trackedObjects.clear()
         trackingStartTimeMs = 0L
-        _uiState.update { it.copy(isTracking = false, currentSpeed = 0.0) }
+        pinnedTrackId = -1
+        _uiState.update { it.copy(isTracking = false, currentSpeed = 0.0, selectedObjectIndex = -1) }
     }
 
     fun stopTrackingAndSave() {
         trackedObjects.clear()
         trackingStartTimeMs = 0L
-        _uiState.update { it.copy(isTracking = false, currentSpeed = 0.0, showLabelDialog = true) }
+        pinnedTrackId = -1
+        _uiState.update {
+            it.copy(isTracking = false, currentSpeed = 0.0, selectedObjectIndex = -1, showLabelDialog = true)
+        }
     }
 
     fun zoomIn() {
