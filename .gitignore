@@ -1,0 +1,4 @@
+/.gradle
+/app/build
+/opencv/.cxx/Debug
+/opencv
