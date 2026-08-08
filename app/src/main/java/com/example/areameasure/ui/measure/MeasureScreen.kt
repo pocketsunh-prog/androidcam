@@ -248,6 +248,7 @@ fun MeasureScreen(
                             maxSpeed = uiState.maxSpeed,
                             distance = uiState.totalDistance,
                             elapsedSeconds = uiState.elapsedSeconds,
+                            calibrated = uiState.speedPixelsPerMm != null,
                             modifier = Modifier.align(Alignment.TopCenter)
                         )
                     }
@@ -325,12 +326,26 @@ fun MeasureScreen(
         }
     }
 
-    // Calibration dialog (SIZE)
+    // Calibration dialog (SIZE) — a known reference rectangle (width + height, mm)
+    // so the plane can be rectified and measurements corrected for tilt/rotation.
     if (uiState.mode == MeasureMode.SIZE && uiState.showCalibrationDialog) {
         CalibrationDialog(
-            pixelX = uiState.selectedPixelX,
+            pixelWidth = uiState.selectedPixelX,
+            pixelHeight = uiState.selectedPixelY,
             onDismiss = { viewModel.dismissCalibrationDialog() },
-            onCalibrate = { knownMm -> viewModel.setCalibration(knownMm) }
+            onCalibrate = { w, h -> viewModel.setSizeCalibration(w, h) }
+        )
+    }
+
+    // Calibration dialog (SPEED) — sets the pixels/mm scale so speed/distance
+    // can be reported in real units (m/s, m) instead of raw pixels. Only a single
+    // length is needed, so the height field stays hidden.
+    if (uiState.mode == MeasureMode.SPEED && uiState.showSpeedCalibrationDialog) {
+        CalibrationDialog(
+            pixelWidth = uiState.speedCalibrationPixelX,
+            pixelHeight = null,
+            onDismiss = { viewModel.dismissSpeedCalibrationDialog() },
+            onCalibrate = { w, _ -> viewModel.setSpeedCalibration(w) }
         )
     }
 
@@ -458,8 +473,8 @@ private fun SizeControls(uiState: MeasureUiState, viewModel: MeasureViewModel) {
         }
     } else if (uiState.isCameraRunning && uiState.selectedObjectIndex >= 0) {
         Text(
-            text = uiState.pixelsPerMm?.let { "Calibrated — tap another object" }
-                ?: "Tap object, then enter its real size",
+            text = if (uiState.isCalibrated) "Calibrated — tap another object"
+            else "Tap object, then enter the reference size",
             style = MaterialTheme.typography.bodyMedium,
             color = Color(0xFFFFAB40)
         )
@@ -485,7 +500,7 @@ private fun SizeControls(uiState: MeasureUiState, viewModel: MeasureViewModel) {
         horizontalArrangement = Arrangement.SpaceEvenly,
         verticalAlignment = Alignment.CenterVertically
     ) {
-        if (uiState.isCameraRunning && uiState.selectedObjectIndex >= 0 && uiState.pixelsPerMm == null) {
+        if (uiState.isCameraRunning && uiState.selectedObjectIndex >= 0 && !uiState.isCalibrated) {
             Button(
                 onClick = { viewModel.showCalibrationDialog() },
                 colors = ButtonDefaults.buttonColors(containerColor = Color(0xFFFF9800))
@@ -530,7 +545,10 @@ private fun SpeedControls(uiState: MeasureUiState, viewModel: MeasureViewModel) 
 
     if (uiState.isCameraRunning && !uiState.isTracking) {
         Text(
-            text = "Tap an object to measure its speed, or wait to auto-track",
+            text = if (uiState.speedPixelsPerMm == null)
+                "Tap the object you want to track, then enter its real size"
+            else
+                "Tap an object to measure its speed, or wait to auto-track",
             style = MaterialTheme.typography.bodyMedium,
             color = Color(0xFFAAAAAA)
         )
@@ -602,11 +620,26 @@ private fun UnitDropdown(
 
 @Composable
 private fun CalibrationDialog(
-    pixelX: Double?,
+    /** Detected width in pixels (always shown). */
+    pixelWidth: Double?,
+    /**
+     * Detected height in pixels. When non-null the dialog asks for both width
+     * and height (SIZE mode, for a reference rectangle). When null only the
+     * width/length field is shown (SPEED mode).
+     */
+    pixelHeight: Double?,
     onDismiss: () -> Unit,
-    onCalibrate: (Double) -> Unit
+    onCalibrate: (widthMm: Double, heightMm: Double) -> Unit
 ) {
-    var inputValue by remember { mutableStateOf("") }
+    var widthValue by remember { mutableStateOf("") }
+    var heightValue by remember { mutableStateOf("") }
+
+    // A reference rectangle needs both dimensions; a speed target only one.
+    val askHeight = pixelHeight != null
+    val widthMm = widthValue.toDoubleOrNull()
+    val heightMm = heightValue.toDoubleOrNull()
+    val canConfirm = widthMm != null && widthMm > 0 &&
+        (!askHeight || (heightMm != null && heightMm > 0))
 
     AlertDialog(
         onDismissRequest = onDismiss,
@@ -614,33 +647,48 @@ private fun CalibrationDialog(
         text = {
             Column {
                 Text(
-                    "Enter the real-world length of the X axis (width) in millimeters.",
+                    if (askHeight)
+                        "Enter the real-world width and height of the reference " +
+                            "object (e.g. a credit card) in millimeters."
+                    else
+                        "Enter the real-world length of the tracked object in millimeters.",
                     style = MaterialTheme.typography.bodyMedium
                 )
-                if (pixelX != null) {
+                if (pixelWidth != null) {
                     Text(
-                        "Detected: ${"%.1f".format(pixelX)} pixels",
+                        "Detected: ${"%.1f".format(pixelWidth)} px" +
+                            if (askHeight) " × ${"%.1f".format(pixelHeight)} px" else "",
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant
                     )
                 }
                 Spacer(modifier = Modifier.height(12.dp))
                 OutlinedTextField(
-                    value = inputValue,
-                    onValueChange = { inputValue = it },
-                    label = { Text("Length (mm)") },
-                    placeholder = { Text("e.g. 50") },
+                    value = widthValue,
+                    onValueChange = { widthValue = it },
+                    label = { Text(if (askHeight) "Width (mm)" else "Length (mm)") },
+                    placeholder = { Text("e.g. 85.6") },
                     singleLine = true
                 )
+                if (askHeight) {
+                    Spacer(modifier = Modifier.height(8.dp))
+                    OutlinedTextField(
+                        value = heightValue,
+                        onValueChange = { heightValue = it },
+                        label = { Text("Height (mm)") },
+                        placeholder = { Text("e.g. 53.9") },
+                        singleLine = true
+                    )
+                }
             }
         },
         confirmButton = {
             TextButton(
                 onClick = {
-                    val mm = inputValue.toDoubleOrNull()
-                    if (mm != null && mm > 0) onCalibrate(mm)
+                    // When only width is asked, mirror it to height (square fallback).
+                    onCalibrate(widthMm ?: 0.0, if (askHeight) (heightMm ?: 0.0) else (widthMm ?: 0.0))
                 },
-                enabled = inputValue.toDoubleOrNull()?.let { it > 0 } == true
+                enabled = canConfirm
             ) { Text("Calibrate") }
         },
         dismissButton = {
@@ -682,8 +730,15 @@ private fun SpeedOverlay(
     maxSpeed: Double,
     distance: Double,
     elapsedSeconds: Double,
+    /** True once SPEED calibration has set a real-world scale. */
+    calibrated: Boolean,
     modifier: Modifier = Modifier
 ) {
+    // Until calibration, values are raw pixels — label them honestly as px/s,
+    // px rather than pretending they are metric. After calibration they are
+    // m/s and m.
+    val speedUnit = if (calibrated) "m/s" else "px/s"
+    val distUnit = if (calibrated) "m" else "px"
     Column(
         modifier = modifier
             .fillMaxWidth()
@@ -699,7 +754,7 @@ private fun SpeedOverlay(
             modifier = Modifier.size(28.dp)
         )
         Text(
-            text = "${"%.1f".format(speed)} m/s",
+            text = "${"%.1f".format(speed)} $speedUnit",
             style = MaterialTheme.typography.headlineMedium,
             fontWeight = FontWeight.Bold,
             color = Color.White
@@ -709,8 +764,8 @@ private fun SpeedOverlay(
             modifier = Modifier.fillMaxWidth(),
             horizontalArrangement = Arrangement.SpaceEvenly
         ) {
-            StatItem("Max", "${"%.1f".format(maxSpeed)} m/s")
-            StatItem("Dist", "${"%.1f".format(distance)} m")
+            StatItem("Max", "${"%.1f".format(maxSpeed)} $speedUnit")
+            StatItem("Dist", "${"%.1f".format(distance)} $distUnit")
             StatItem("Time", "${"%.1f".format(elapsedSeconds)} s")
         }
     }

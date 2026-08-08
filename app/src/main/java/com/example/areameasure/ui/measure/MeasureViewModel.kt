@@ -11,6 +11,7 @@ import com.example.areameasure.data.repository.MeasurementRepository
 import com.example.areameasure.data.repository.SpeedRepository
 import com.example.areameasure.domain.AreaCalculator
 import com.example.areameasure.domain.MeasureMode
+import com.example.areameasure.domain.PerspectiveCalibration
 import com.example.areameasure.processing.ImageProcessor
 import dagger.hilt.android.lifecycle.HiltViewModel
 import kotlinx.coroutines.Job
@@ -81,20 +82,44 @@ data class MeasureUiState(
     val showCalibrationDialog: Boolean = false,
     val lastCapturedImagePath: String? = null,
     val selectedObjectIndex: Int = -1,
-    /** Calibration: pixels per millimeter. null = not calibrated yet. */
-    val pixelsPerMm: Double? = null,
+    /**
+     * True once SIZE mode has a perspective (homography) calibration from a known
+     * reference rectangle. Replaces the old single scalar `pixelsPerMm`, which
+     * couldn't correct for perspective tilt or in-plane rotation.
+     */
+    val isCalibrated: Boolean = false,
+    /** Real width/height (mm) of the reference rectangle used for calibration (for display). */
+    val calibrationWidthMm: Double? = null,
+    val calibrationHeightMm: Double? = null,
     val dimensions: Dimensions3D? = null,
+    /** Pixel-space dimensions of the currently selected object (shown in the calibration dialog). */
     val selectedPixelX: Double? = null,
     val selectedPixelY: Double? = null,
     val selectedPixelZ: Double? = null,
     // --- SPEED mode ---
     val isTracking: Boolean = false,
+    /** Fastest active object's speed in m/s once calibrated (px/s before). */
     val currentSpeed: Double = 0.0,
     val maxSpeed: Double = 0.0,
+    /** Total distance in meters once calibrated (px before). */
     val totalDistance: Double = 0.0,
     val elapsedSeconds: Double = 0.0,
     val zoomRatio: Float = 1.0f,
     val maxZoomRatio: Float = 1.0f,
+    /**
+     * Calibration for SPEED mode: pixels per millimeter of the tracked object.
+     * null = not calibrated yet — speed/distance are still raw pixels. Distinct
+     * from SIZE mode's [pixelsPerMm], which measures a different object/distance.
+     */
+    val speedPixelsPerMm: Double? = null,
+    /** Zoom ratio captured at the moment of speed calibration, so the scale can be recomputed if zoom changes. */
+    val speedCalibrationZoom: Double = 1.0,
+    /** Pixel width of the object chosen for speed calibration (shown in the dialog). */
+    val speedCalibrationPixelX: Double? = null,
+    /** Contour index chosen for speed calibration, so it can be pinned once calibrated. */
+    val speedCalibrationContourIndex: Int = -1,
+    /** True while the speed calibration dialog is open. */
+    val showSpeedCalibrationDialog: Boolean = false,
     /**
      * Clockwise rotation (a multiple of 90°) applied to the raw analysis frame
      * so the contour overlay matches the upright preview. The raw frame is
@@ -115,6 +140,29 @@ class MeasureViewModel @Inject constructor(
     val uiState: StateFlow<MeasureUiState> = _uiState.asStateFlow()
 
     private var processingCollectionJob: Job? = null
+
+    // --- SIZE calibration state ---
+
+    /**
+     * Active perspective calibration for SIZE mode, mapping image pixels to
+     * millimetres on the reference plane. null = not calibrated. Stored outside
+     * the UI state because it holds a native OpenCV Mat.
+     */
+    private var sizeCalibration: PerspectiveCalibration.PlaneCalibration? = null
+
+    /**
+     * Contour of the currently selected object, retained so the calibration step
+     * can extract its four corners. ImageProcessor does not release detected
+     * contours, so this reference stays valid until the next detection pass.
+     */
+    private var selectedContour: org.opencv.core.MatOfPoint? = null
+
+    /** Release the native homography Mat and drop the SIZE calibration. */
+    private fun clearSizeCalibration() {
+        sizeCalibration?.homography?.release()
+        sizeCalibration = null
+        selectedContour = null
+    }
 
     // --- SPEED tracking state ---
 
@@ -151,6 +199,8 @@ class MeasureViewModel @Inject constructor(
         trackedObjects.clear()
         pinnedTrackId = -1
         if (_uiState.value.isCameraRunning) stopCamera()
+        // SIZE calibration is mode-specific — drop the homography when switching.
+        if (mode != MeasureMode.SIZE) clearSizeCalibration()
         cameraManager.measureMode = mode
         _uiState.update {
             it.copy(
@@ -162,7 +212,14 @@ class MeasureViewModel @Inject constructor(
                 totalDistance = 0.0,
                 elapsedSeconds = 0.0,
                 selectedObjectIndex = -1,
-                pixelsPerMm = null,
+                isCalibrated = false,
+                calibrationWidthMm = null,
+                calibrationHeightMm = null,
+                speedPixelsPerMm = null,
+                speedCalibrationZoom = 1.0,
+                speedCalibrationPixelX = null,
+                speedCalibrationContourIndex = -1,
+                showSpeedCalibrationDialog = false,
                 dimensions = null,
                 selectedPixelX = null,
                 selectedPixelY = null,
@@ -228,10 +285,13 @@ class MeasureViewModel @Inject constructor(
      */
     fun reset() {
         stopCamera()
+        clearSizeCalibration()
         _uiState.update {
             it.copy(
                 selectedObjectIndex = -1,
-                pixelsPerMm = null,
+                isCalibrated = false,
+                calibrationWidthMm = null,
+                calibrationHeightMm = null,
                 dimensions = null,
                 selectedPixelX = null,
                 selectedPixelY = null,
@@ -241,6 +301,10 @@ class MeasureViewModel @Inject constructor(
                 maxSpeed = 0.0,
                 totalDistance = 0.0,
                 elapsedSeconds = 0.0,
+                speedPixelsPerMm = null,
+                speedCalibrationZoom = 1.0,
+                speedCalibrationPixelX = null,
+                speedCalibrationContourIndex = -1,
                 showCalibrationDialog = false,
                 isCapturing = false,
                 lastCapturedImagePath = null
@@ -313,22 +377,31 @@ class MeasureViewModel @Inject constructor(
                     )
                 }
 
-                // SIZE: compute real-world dimensions once calibrated.
+                // SIZE: compute real-world dimensions once a plane calibration exists.
                 val selectedObj = result.selectedObject
-                val pixelsPerMm = _uiState.value.pixelsPerMm
+                val calibration = sizeCalibration
                 val dimensions: Dimensions3D?
-                if (mode == MeasureMode.SIZE && selectedObj != null && pixelsPerMm != null && pixelsPerMm > 0) {
-                    val (dx, dy, dz) = AreaCalculator.calculateDimensions(
-                        pixelX = selectedObj.pixelWidth,
-                        pixelY = selectedObj.pixelHeight,
-                        pixelZ = selectedObj.pixelDepth,
-                        pixelsPerMm = pixelsPerMm,
+                if (mode == MeasureMode.SIZE && selectedObj != null && calibration != null) {
+                    // Rectify the selected object's four bounding corners through the
+                    // homography to get its real side lengths (mm), correcting for
+                    // the phone's tilt and rotation over the surface.
+                    val corners = PerspectiveCalibration.cornersOf(selectedObj.contour)
+                    val (widthMm, heightMm) = PerspectiveCalibration.measure(
+                        calibration, corners
+                    )
+                    val (dx, dy, dz) = AreaCalculator.fromPlaneMm(
+                        widthMm = widthMm,
+                        heightMm = heightMm,
                         unit = _uiState.value.unit
                     )
                     dimensions = Dimensions3D(dx, dy, dz)
                 } else {
                     dimensions = null
                 }
+
+                // Retain the selected object's contour so calibration can extract
+                // its four corners. Cleared via clearSizeCalibration() on reset.
+                if (mode == MeasureMode.SIZE) selectedContour = selectedObj?.contour
 
                 _uiState.update {
                     it.copy(
@@ -395,7 +468,7 @@ class MeasureViewModel @Inject constructor(
         if (closestIndex >= 0) {
             _uiState.update { it.copy(selectedObjectIndex = closestIndex) }
             cameraManager.setTargetContourIndex(closestIndex)
-            if (state.pixelsPerMm == null) {
+            if (!state.isCalibrated) {
                 _uiState.update { it.copy(showCalibrationDialog = true) }
             }
         }
@@ -452,12 +525,28 @@ class MeasureViewModel @Inject constructor(
             return
         }
 
-        // Drop any previous pin before setting the new one.
-        if (pinnedTrack != null) {
-            trackedObjects.remove(pinnedTrackId)
-        }
-
         if (closestIndex >= 0) {
+            // SPEED mode needs a real-world scale before it can report m/s. The
+            // first tap on an object captures its pixel width and prompts the
+            // user to enter its real size; only after that do we pin and track.
+            if (_uiState.value.speedPixelsPerMm == null) {
+                val obj = state.detectedObjects.firstOrNull { it.contourIndex == closestIndex }
+                if (obj != null) {
+                    _uiState.update {
+                        it.copy(
+                            speedCalibrationPixelX = obj.pixelWidth.toDouble(),
+                            speedCalibrationContourIndex = closestIndex,
+                            showSpeedCalibrationDialog = true
+                        )
+                    }
+                }
+                return
+            }
+
+            // Already calibrated — drop any previous pin before setting the new one.
+            if (pinnedTrack != null) {
+                trackedObjects.remove(pinnedTrackId)
+            }
             // Ensure a live track exists for the pinned object so its speed is
             // measured even if it isn't currently moving enough to auto-track.
             val id = ensurePinnedTrack(state.detectedObjects, closestIndex)
@@ -467,6 +556,46 @@ class MeasureViewModel @Inject constructor(
             // Tapped empty space — clear the pin.
             pinnedTrackId = -1
             _uiState.update { it.copy(selectedObjectIndex = -1) }
+        }
+    }
+
+    /**
+     * Apply a real-world scale to SPEED mode from the object the user tapped.
+     * Computes pixels/mm (at the current zoom) and closes the calibration dialog.
+     */
+    fun setSpeedCalibration(knownLengthMm: Double) {
+        val pixelX = _uiState.value.speedCalibrationPixelX ?: return
+        if (knownLengthMm <= 0 || pixelX <= 0) return
+        val zoom = _uiState.value.zoomRatio.toDouble().coerceAtLeast(1.0)
+        val contourIndex = _uiState.value.speedCalibrationContourIndex
+        _uiState.update {
+            it.copy(
+                // Scale to the zoom at calibration time; speed conversion adjusts
+                // for any later zoom change relative to this baseline.
+                speedPixelsPerMm = pixelX / knownLengthMm * zoom,
+                speedCalibrationZoom = zoom,
+                speedCalibrationPixelX = null,
+                speedCalibrationContourIndex = -1,
+                showSpeedCalibrationDialog = false
+            )
+        }
+        // Pin the object that was calibrated so tracking begins immediately.
+        if (contourIndex >= 0) {
+            val id = ensurePinnedTrack(_uiState.value.detectedObjects, contourIndex)
+            if (id >= 0) {
+                pinnedTrackId = id
+                _uiState.update { it.copy(selectedObjectIndex = contourIndex) }
+            }
+        }
+    }
+
+    fun dismissSpeedCalibrationDialog() {
+        _uiState.update {
+            it.copy(
+                showSpeedCalibrationDialog = false,
+                speedCalibrationPixelX = null,
+                speedCalibrationContourIndex = -1
+            )
         }
     }
 
@@ -500,12 +629,26 @@ class MeasureViewModel @Inject constructor(
         return id
     }
 
-    fun setCalibration(knownLengthMm: Double) {
-        val pixelX = _uiState.value.selectedPixelX ?: return
-        if (knownLengthMm <= 0 || pixelX <= 0) return
+    /**
+     * Calibrate SIZE mode from a known reference rectangle (e.g. a credit card)
+     * resting on the surface. Rectifies the selected object's four bounding
+     * corners to compute a homography to millimetres on that plane, so later
+     * measurements correct for the phone's tilt and rotation.
+     */
+    fun setSizeCalibration(widthMm: Double, heightMm: Double) {
+        val contour = selectedContour ?: return
+        if (widthMm <= 0 || heightMm <= 0) return
+        val imageCorners = PerspectiveCalibration.cornersOf(contour)
+        // Replace any prior calibration, releasing its native Mat.
+        clearSizeCalibration()
+        sizeCalibration = PerspectiveCalibration.calibrate(
+            imageCorners, widthMm, heightMm
+        )
         _uiState.update {
             it.copy(
-                pixelsPerMm = pixelX / knownLengthMm,
+                isCalibrated = true,
+                calibrationWidthMm = widthMm,
+                calibrationHeightMm = heightMm,
                 showCalibrationDialog = false
             )
         }
@@ -583,7 +726,14 @@ class MeasureViewModel @Inject constructor(
     // ---------------------------------------------------------------- SPEED mode
 
     private fun handleSpeedFrame(result: ImageProcessor.ProcessingResult) {
-        val now = System.currentTimeMillis()
+        // Prefer the sensor-capture timestamp for frame-to-frame dt: it reflects
+        // when the frame was actually exposed and is immune to wall-clock jitter
+        // under frame drops. Fall back to the wall clock when unavailable.
+        val now = if (result.frameTimestampNanos > 0L) {
+            result.frameTimestampNanos / 1_000_000L
+        } else {
+            System.currentTimeMillis()
+        }
 
         // Ignore motion for a short window after the camera starts so handshake
         // jitter doesn't get mistaken for a moving object. This lets the user
@@ -721,17 +871,36 @@ class MeasureViewModel @Inject constructor(
 
     /** Accumulate displacement/speed for one matched track against its object. */
     private fun updateTrack(track: TrackedObject, obj: ImageProcessor.DetectedObject, now: Long) {
-        val displacement = distance(track.lastPosition.x, track.lastPosition.y, obj.center.x, obj.center.y)
+        val displacementPx = distance(track.lastPosition.x, track.lastPosition.y, obj.center.x, obj.center.y)
         track.contourIndex = obj.contourIndex
         track.lastPosition = obj.center
         track.lastFrameTimeMs = now
-        if (displacement in MOVING_THRESHOLD_PX..MAX_DISPLACEMENT_PX) {
+        if (displacementPx in MOVING_THRESHOLD_PX..MAX_DISPLACEMENT_PX) {
             val timeDelta = now - track.lastMovementTimeMs
-            val instantSpeed = if (timeDelta > 0) displacement / (timeDelta / 1000.0) else 0.0
+            // Convert pixel displacement to real-world meters using the SPEED
+            // calibration and the current zoom (relative to calibration zoom).
+            val displacementM = pixelsToMeters(displacementPx)
+            val instantSpeed = if (timeDelta > 0) displacementM / (timeDelta / 1000.0) else 0.0
             track.smoothedSpeed = smoothSpeed(track.smoothedSpeed, instantSpeed)
-            track.totalDistance += displacement
+            track.totalDistance += displacementM
             track.lastMovementTimeMs = now
         }
+    }
+
+    /**
+     * Convert a pixel distance to meters using the active SPEED calibration.
+     * Returns the raw pixel distance unchanged when not calibrated yet (the
+     * overlay then shows px/s and m/s is suppressed until calibration completes).
+     */
+    private fun pixelsToMeters(pixels: Double): Double {
+        val pixelsPerMm = _uiState.value.speedPixelsPerMm ?: return pixels
+        val calibrationZoom = _uiState.value.speedCalibrationZoom.coerceAtLeast(1.0)
+        val currentZoom = _uiState.value.zoomRatio.toDouble().coerceAtLeast(1.0)
+        // pixelsPerMm was measured at calibrationZoom; magnification scales linearly
+        // with zoom, so effective pixels/mm at the current zoom is:
+        val effectivePixelsPerMm = pixelsPerMm * (currentZoom / calibrationZoom)
+        val mm = pixels / effectivePixelsPerMm
+        return mm / 1000.0
     }
 
     /**
@@ -899,6 +1068,7 @@ class MeasureViewModel @Inject constructor(
 
     override fun onCleared() {
         super.onCleared()
+        clearSizeCalibration()
         cameraManager.shutdown()
         processingCollectionJob?.cancel()
     }

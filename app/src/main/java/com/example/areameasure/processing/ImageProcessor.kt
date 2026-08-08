@@ -51,7 +51,13 @@ class ImageProcessor {
         val frameWidth: Int,
         val frameHeight: Int,
         val detectedObjects: List<DetectedObject>,
-        val selectedIndex: Int
+        val selectedIndex: Int,
+        /**
+         * Hardware capture timestamp of this frame, in nanoseconds. Used for
+         * accurate frame-to-frame dt in speed tracking (more stable than wall
+         * clock, which jitters under frame drops). 0 when unavailable.
+         */
+        val frameTimestampNanos: Long = 0L
     ) {
         val selectedObject: DetectedObject?
             get() = detectedObjects.getOrNull(selectedIndex)

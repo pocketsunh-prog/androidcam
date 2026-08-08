@@ -32,7 +32,9 @@ class CameraFrameAnalyzer(
                 inputMat = mat,
                 selectedTargetIndex = targetContourIndex
             )
-            onResult(result)
+            // Stamp the hardware capture timestamp so the ViewModel can compute
+            // frame-to-frame dt from the sensor clock instead of the wall clock.
+            onResult(result.copy(frameTimestampNanos = image.imageInfo.timestamp))
         } catch (e: Exception) {
             Log.e(TAG, "Frame analysis failed", e)
         } finally {

@@ -3,34 +3,34 @@ package com.example.areameasure.domain
 import com.example.areameasure.data.model.UnitOfMeasure
 
 /**
- * Converts pixel-space 3D measurements into real-world dimensions
- * using a calibration factor (pixels per millimeter).
+ * Converts real-world measurements on the calibrated plane into the user's
+ * chosen unit. Pixel-to-millimetre conversion is no longer done here: it happens
+ * in the homography step ([PerspectiveCalibration]), which also corrects for
+ * perspective tilt and in-plane rotation.
  */
 object AreaCalculator {
 
     /**
-     * Convert pixel dimensions to real-world dimensions.
+     * Express a plane measurement (already in millimetres) in [unit].
      *
-     * @param pixelX      Width in pixels
-     * @param pixelY      Height in pixels
-     * @param pixelZ      Depth in pixels
-     * @param pixelsPerMm Calibration: how many pixels equal one millimeter
-     * @param unit        Target output unit
+     * X and Y are the two measurable side lengths of the object on the plane.
+     * Z (depth, out of the plane) cannot be recovered from a single 2D frame, so
+     * we anchor it to X and assume roughly cubic proportions (Z ≈ X).
+     *
+     * @param widthMm  longer side length in millimetres (X)
+     * @param heightMm shorter side length in millimetres (Y)
+     * @param unit     target output unit
      * @return Triple of (X, Y, Z) in the requested unit
      */
-    fun calculateDimensions(
-        pixelX: Double,
-        pixelY: Double,
-        pixelZ: Double,
-        pixelsPerMm: Double,
+    fun fromPlaneMm(
+        widthMm: Double,
+        heightMm: Double,
         unit: UnitOfMeasure
     ): Triple<Double, Double, Double> {
-        val mmX = pixelX / pixelsPerMm
-        val mmY = pixelY / pixelsPerMm
-        val mmZ = pixelZ / pixelsPerMm
+        val mmZ = widthMm
         return Triple(
-            mmX * unit.mmFactor,
-            mmY * unit.mmFactor,
+            widthMm * unit.mmFactor,
+            heightMm * unit.mmFactor,
             mmZ * unit.mmFactor
         )
     }
