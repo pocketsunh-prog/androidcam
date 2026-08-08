@@ -1,5 +1,6 @@
 package com.example.areameasure.domain
 
+import org.opencv.core.Core
 import org.opencv.core.Mat
 import org.opencv.core.MatOfPoint
 import org.opencv.core.MatOfPoint2f
@@ -110,5 +111,19 @@ object PerspectiveCalibration {
         val longer = maxOf(d01, d12)
         val shorter = minOf(d01, d12)
         return Pair(longer, shorter)
+    }
+
+    /**
+     * Map a single image point to its position in millimetres on the calibrated
+     * plane. Used by SPEED mode to convert a tracked object's frame-to-frame
+     * displacement from pixels into real-world metres.
+     */
+    fun transformPoint(calibration: PlaneCalibration, point: Point): Point {
+        val src = MatOfPoint2f(point)
+        val dst = MatOfPoint2f()
+        Core.perspectiveTransform(src, dst, calibration.homography)
+        val out = dst.toArray()[0]
+        src.release(); dst.release()
+        return out
     }
 }

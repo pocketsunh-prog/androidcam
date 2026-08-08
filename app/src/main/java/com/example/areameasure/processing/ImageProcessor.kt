@@ -4,6 +4,7 @@ import org.opencv.core.Mat
 import org.opencv.core.MatOfPoint
 import org.opencv.core.MatOfPoint2f
 import org.opencv.core.Point
+import org.opencv.core.Rect
 import org.opencv.core.Scalar
 import org.opencv.core.Size
 import org.opencv.imgproc.Imgproc
@@ -57,7 +58,9 @@ class ImageProcessor {
          * accurate frame-to-frame dt in speed tracking (more stable than wall
          * clock, which jitters under frame drops). 0 when unavailable.
          */
-        val frameTimestampNanos: Long = 0L
+        val frameTimestampNanos: Long = 0L,
+        /** Faces detected in this frame (raw-frame pixel coords). Empty unless [detectFaces]. */
+        val detectedFaces: List<Rect> = emptyList()
     ) {
         val selectedObject: DetectedObject?
             get() = detectedObjects.getOrNull(selectedIndex)
@@ -75,6 +78,13 @@ class ImageProcessor {
 
     /** Whether to draw the 3D orientation axes on the selected object. */
     var drawAxes: Boolean = true
+
+    /**
+     * When true, each frame is also scanned for frontal faces (PEOPLE mode).
+     * Detected faces are returned in [ProcessingResult.detectedFaces] and drawn
+     * as green rectangles on the annotated frame.
+     */
+    var detectFaces: Boolean = false
 
     /**
      * Process a camera frame.
@@ -183,6 +193,25 @@ class ImageProcessor {
             }
         }
 
+        // 11. Detect faces (PEOPLE mode) and draw them as green rectangles.
+        // Runs on the grayscale frame produced in step 1; the detector downscales
+        // internally for speed and returns rects in the original frame's coords.
+        val faces = if (detectFaces) {
+            val detected = com.example.areameasure.processing.FaceDetector.detect(gray)
+            detected.forEach { face ->
+                Imgproc.rectangle(
+                    annotated,
+                    Point(face.x.toDouble(), face.y.toDouble()),
+                    Point((face.x + face.width).toDouble(), (face.y + face.height).toDouble()),
+                    Scalar(0.0, 255.0, 0.0),
+                    3
+                )
+            }
+            detected
+        } else {
+            emptyList()
+        }
+
         // Release intermediate mats
         gray.release(); blurred.release(); edges.release(); hierarchy.release(); kernel.release()
 
@@ -191,7 +220,8 @@ class ImageProcessor {
             frameWidth = frameWidth,
             frameHeight = frameHeight,
             detectedObjects = detectedObjects,
-            selectedIndex = selectedIdx
+            selectedIndex = selectedIdx,
+            detectedFaces = faces
         )
     }
 

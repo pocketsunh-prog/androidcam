@@ -95,6 +95,10 @@ class MeasureCameraManager @Inject constructor(
             // Draw the 3D X/Y/Z axes only while measuring size.
             imageProcessor.drawAxes = measureMode == MeasureMode.SIZE
 
+            // Scan for faces only in PEOPLE mode. The detector is initialized
+            // once at app startup; this just toggles per-frame detection.
+            imageProcessor.detectFaces = measureMode == MeasureMode.PEOPLE
+
             // Align the preview to the display rotation so it isn't shown
             // sideways in a portrait UI (the camera sensor is landscape).
             val displayRotation = (context.getSystemService(Context.WINDOW_SERVICE) as WindowManager)

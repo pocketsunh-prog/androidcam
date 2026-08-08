@@ -3,8 +3,10 @@ package com.example.areameasure.ui.history
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import com.example.areameasure.data.model.Measurement
+import com.example.areameasure.data.model.PeopleCountMeasurement
 import com.example.areameasure.data.model.SpeedMeasurement
 import com.example.areameasure.data.repository.MeasurementRepository
+import com.example.areameasure.data.repository.PeopleCountRepository
 import com.example.areameasure.data.repository.SpeedRepository
 import dagger.hilt.android.lifecycle.HiltViewModel
 import kotlinx.coroutines.flow.SharingStarted
@@ -15,7 +17,8 @@ import javax.inject.Inject
 @HiltViewModel
 class HistoryViewModel @Inject constructor(
     measurementRepository: MeasurementRepository,
-    speedRepository: SpeedRepository
+    speedRepository: SpeedRepository,
+    peopleCountRepository: PeopleCountRepository
 ) : ViewModel() {
 
     val measurements: StateFlow<List<Measurement>> = measurementRepository
@@ -27,6 +30,14 @@ class HistoryViewModel @Inject constructor(
         )
 
     val speedMeasurements: StateFlow<List<SpeedMeasurement>> = speedRepository
+        .getAllMeasurements()
+        .stateIn(
+            scope = viewModelScope,
+            started = SharingStarted.WhileSubscribed(5_000),
+            initialValue = emptyList()
+        )
+
+    val peopleMeasurements: StateFlow<List<PeopleCountMeasurement>> = peopleCountRepository
         .getAllMeasurements()
         .stateIn(
             scope = viewModelScope,

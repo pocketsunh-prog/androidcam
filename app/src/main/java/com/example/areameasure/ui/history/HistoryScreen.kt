@@ -17,6 +17,7 @@ import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
+import androidx.compose.material.icons.filled.Person
 import androidx.compose.material.icons.filled.PhotoCamera
 import androidx.compose.material.icons.filled.Speed
 import androidx.compose.material.icons.filled.SquareFoot
@@ -44,6 +45,7 @@ import androidx.compose.ui.unit.dp
 import androidx.hilt.navigation.compose.hiltViewModel
 import coil.compose.AsyncImage
 import com.example.areameasure.data.model.Measurement
+import com.example.areameasure.data.model.PeopleCountMeasurement
 import com.example.areameasure.data.model.SpeedMeasurement
 import com.example.areameasure.domain.SpeedTracker
 import java.io.File
@@ -60,6 +62,7 @@ fun HistoryScreen(
 ) {
     val measurements by viewModel.measurements.collectAsState()
     val speedMeasurements by viewModel.speedMeasurements.collectAsState()
+    val peopleMeasurements by viewModel.peopleMeasurements.collectAsState()
     val selectedTab = remember { mutableIntStateOf(0) }
 
     Scaffold(
@@ -93,6 +96,12 @@ fun HistoryScreen(
                     text = { Text("Speed") },
                     icon = { Icon(Icons.Default.Speed, contentDescription = null) }
                 )
+                Tab(
+                    selected = selectedTab.intValue == 2,
+                    onClick = { selectedTab.intValue = 2 },
+                    text = { Text("People") },
+                    icon = { Icon(Icons.Default.Person, contentDescription = null) }
+                )
             }
 
             // Tab content
@@ -104,6 +113,10 @@ fun HistoryScreen(
                 1 -> SpeedMeasurementList(
                     measurements = speedMeasurements,
                     onItemClick = { id -> onNavigateToDetail("speed", id) }
+                )
+                2 -> PeopleCountList(
+                    measurements = peopleMeasurements,
+                    onItemClick = { id -> onNavigateToDetail("people", id) }
                 )
             }
         }
@@ -159,6 +172,92 @@ private fun SpeedMeasurementList(
             item { Spacer(modifier = Modifier.height(4.dp)) }
             items(measurements, key = { it.id }) { measurement ->
                 SpeedMeasurementCard(
+                    measurement = measurement,
+                    onClick = { onItemClick(measurement.id) }
+                )
+            }
+            item { Spacer(modifier = Modifier.height(8.dp)) }
+        }
+    }
+}
+
+/**
+ * List of people-count snapshots (new).
+ */
+@Composable
+private fun PeopleCountCard(
+    measurement: PeopleCountMeasurement,
+    onClick: () -> Unit
+) {
+    val dateFormat = remember { SimpleDateFormat("MMM d, yyyy • h:mm a", Locale.getDefault()) }
+
+    Card(
+        modifier = Modifier
+            .fillMaxWidth()
+            .clickable(onClick = onClick),
+        shape = RoundedCornerShape(12.dp)
+    ) {
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(12.dp),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            // Person icon placeholder
+            Box(
+                modifier = Modifier
+                    .size(64.dp)
+                    .clip(RoundedCornerShape(8.dp)),
+                contentAlignment = Alignment.Center
+            ) {
+                Icon(
+                    Icons.Default.Person,
+                    contentDescription = null,
+                    modifier = Modifier.size(40.dp),
+                    tint = Color(0xFF4CAF50)
+                )
+            }
+
+            Spacer(modifier = Modifier.width(12.dp))
+
+            Column(modifier = Modifier.weight(1f)) {
+                Text(
+                    text = "${measurement.count} ${if (measurement.count == 1) "person" else "people"}",
+                    style = MaterialTheme.typography.titleMedium
+                )
+                Spacer(modifier = Modifier.height(2.dp))
+                Text(
+                    text = "Count snapshot",
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = Color(0xFF4CAF50)
+                )
+                Text(
+                    text = dateFormat.format(Date(measurement.timestamp)),
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+            }
+        }
+    }
+}
+
+@Composable
+private fun PeopleCountList(
+    measurements: List<PeopleCountMeasurement>,
+    onItemClick: (Long) -> Unit
+) {
+    if (measurements.isEmpty()) {
+        EmptyState(message = "No people counts yet")
+    } else {
+        LazyColumn(
+            modifier = Modifier
+                .fillMaxSize()
+                .padding(horizontal = 16.dp),
+            verticalArrangement = Arrangement.spacedBy(8.dp)
+        ) {
+            item { Spacer(modifier = Modifier.height(4.dp)) }
+            items(measurements, key = { it.id }) { measurement ->
+                PeopleCountCard(
                     measurement = measurement,
                     onClick = { onItemClick(measurement.id) }
                 )

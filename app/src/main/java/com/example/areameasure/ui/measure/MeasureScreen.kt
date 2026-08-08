@@ -1,6 +1,7 @@
 package com.example.areameasure.ui.measure
 
 import android.Manifest
+import android.content.Context
 import android.content.pm.PackageManager
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
@@ -10,9 +11,11 @@ import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.gestures.detectTransformGestures
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
@@ -20,6 +23,8 @@ import androidx.compose.foundation.layout.offset
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
@@ -28,6 +33,7 @@ import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.CameraAlt
 import androidx.compose.material.icons.filled.DeleteSweep
 import androidx.compose.material.icons.filled.History
+import androidx.compose.material.icons.filled.Person
 import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material.icons.filled.Remove
 import androidx.compose.material.icons.filled.RestartAlt
@@ -54,6 +60,7 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.MutableState
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
@@ -80,6 +87,220 @@ import androidx.compose.ui.viewinterop.AndroidView
 import com.example.areameasure.data.model.UnitOfMeasure
 import com.example.areameasure.domain.MeasureMode
 
+// ---------------------------------------------------------------- camera preview area
+
+/**
+ * The live camera preview with the contour/face overlay, SPEED labels and zoom
+ * controls, plus the SPEED/PEOPLE readouts floating at the top. This is the
+ * shared "viewfinder" used in both portrait and landscape layouts — only the
+ * surrounding controls differ.
+ */
+@Composable
+private fun CameraPreviewArea(
+    uiState: MeasureUiState,
+    viewModel: MeasureViewModel,
+    previewView: PreviewView,
+    overlaySize: MutableState<IntSize>
+) {
+    val isSpeed = uiState.mode == MeasureMode.SPEED
+    Box(
+        modifier = Modifier
+            .fillMaxSize()
+            .pointerInput(isSpeed) {
+                if (!isSpeed) return@pointerInput
+                detectTransformGestures { _, _, zoom, _ ->
+                    if (uiState.isCameraRunning) {
+                        viewModel.setZoom(uiState.zoomRatio * zoom)
+                    }
+                }
+            }
+    ) {
+        AndroidView(
+            factory = { previewView },
+            modifier = Modifier.fillMaxSize()
+        )
+
+        // Contour overlay
+        if (uiState.isCameraRunning) {
+            uiState.contourBitmap?.let { bitmap ->
+                Image(
+                    bitmap = bitmap.asImageBitmap(),
+                    contentDescription = "Contour overlay",
+                    // Crop-filled to match the PreviewView's FILL_CENTER;
+                    // the bitmap is already rotated to the upright orientation.
+                    contentScale = ContentScale.Crop,
+                    modifier = Modifier
+                        .fillMaxSize()
+                        .onSizeChanged { overlaySize.value = it }
+                        .pointerInput(
+                            uiState.mode,
+                            uiState.detectedObjects.size,
+                            uiState.selectedObjectIndex,
+                            uiState.overlayRotationDegrees
+                        ) {
+                            detectTapGestures { offset ->
+                                when (uiState.mode) {
+                                    MeasureMode.SIZE -> viewModel.onObjectSelected(
+                                        tapX = offset.x,
+                                        tapY = offset.y,
+                                        viewWidth = overlaySize.value.width,
+                                        viewHeight = overlaySize.value.height,
+                                        rotationDegrees = uiState.overlayRotationDegrees
+                                    )
+                                    MeasureMode.SPEED -> viewModel.selectSpeedObject(
+                                        tapX = offset.x,
+                                        tapY = offset.y,
+                                        viewWidth = overlaySize.value.width,
+                                        viewHeight = overlaySize.value.height,
+                                        rotationDegrees = uiState.overlayRotationDegrees
+                                    )
+                                    // PEOPLE mode has no tap-to-select interaction.
+                                    MeasureMode.PEOPLE -> Unit
+                                }
+                            }
+                        }
+                )
+            }
+        }
+
+        // SPEED: per-object speed labels drawn over the overlay
+        if (isSpeed && uiState.isCameraRunning) {
+            SpeedObjectLabels(
+                objects = uiState.detectedObjects,
+                viewWidth = overlaySize.value.width,
+                viewHeight = overlaySize.value.height,
+                calibrated = uiState.speedUsesMetric,
+                viewModel = viewModel
+            )
+        }
+
+        // SPEED: zoom controls on the right
+        if (isSpeed && uiState.isCameraRunning) {
+            ZoomControls(
+                zoomRatio = uiState.zoomRatio,
+                maxZoomRatio = uiState.maxZoomRatio,
+                onZoomIn = { viewModel.zoomIn() },
+                onZoomOut = { viewModel.zoomOut() },
+                modifier = Modifier
+                    .align(Alignment.CenterEnd)
+                    .padding(end = 16.dp)
+            )
+        }
+
+        // SPEED: live speed display overlay at the top. When a SIZE-mode
+        // plane calibration is live, SPEED reuses it to report m/s + m;
+        // otherwise it falls back to raw px/s + px.
+        if (isSpeed && uiState.isTracking && uiState.currentSpeed > 0.0) {
+            SpeedOverlay(
+                speed = uiState.currentSpeed,
+                maxSpeed = uiState.maxSpeed,
+                distance = uiState.totalDistance,
+                elapsedSeconds = uiState.elapsedSeconds,
+                calibrated = uiState.speedUsesMetric,
+                modifier = Modifier.align(Alignment.TopCenter)
+            )
+        }
+
+        // PEOPLE: live face-count overlay at the top.
+        if (uiState.mode == MeasureMode.PEOPLE && uiState.isCameraRunning) {
+            PeopleOverlay(
+                count = uiState.peopleCount,
+                modifier = Modifier.align(Alignment.TopCenter)
+            )
+        }
+    }
+}
+
+/** Start/Stop + mode-specific controls, as an overlay bar (portrait). */
+@Composable
+private fun ControlsBar(
+    uiState: MeasureUiState,
+    viewModel: MeasureViewModel,
+    lifecycleOwner: androidx.lifecycle.LifecycleOwner,
+    previewView: PreviewView,
+    modifier: Modifier = Modifier
+) {
+    Column(
+        modifier = modifier
+            .fillMaxWidth()
+            .background(Color.Black.copy(alpha = 0.8f))
+            .padding(12.dp),
+        horizontalAlignment = Alignment.CenterHorizontally
+    ) {
+        StartStopButton(uiState, viewModel, lifecycleOwner, previewView)
+        Spacer(modifier = Modifier.height(10.dp))
+        ModeControls(uiState, viewModel)
+    }
+}
+
+/** Mode toggle + Start/Stop + mode controls, as a scrollable sidebar (landscape). */
+@Composable
+private fun ControlsSidebar(
+    uiState: MeasureUiState,
+    viewModel: MeasureViewModel,
+    lifecycleOwner: androidx.lifecycle.LifecycleOwner,
+    previewView: PreviewView
+) {
+    Column(
+        modifier = Modifier
+            .width(280.dp)
+            .fillMaxHeight()
+            .background(Color.Black.copy(alpha = 0.85f))
+            .verticalScroll(rememberScrollState())
+            .padding(12.dp),
+        horizontalAlignment = Alignment.CenterHorizontally
+    ) {
+        MeasureModeToggle(
+            selected = uiState.mode,
+            onSelect = { viewModel.selectMode(it) },
+            modifier = Modifier.fillMaxWidth()
+        )
+        Spacer(modifier = Modifier.height(12.dp))
+        StartStopButton(uiState, viewModel, lifecycleOwner, previewView)
+        Spacer(modifier = Modifier.height(12.dp))
+        ModeControls(uiState, viewModel)
+    }
+}
+
+/** The Start / Stop button, shared by the portrait bar and landscape sidebar. */
+@Composable
+private fun StartStopButton(
+    uiState: MeasureUiState,
+    viewModel: MeasureViewModel,
+    lifecycleOwner: androidx.lifecycle.LifecycleOwner,
+    previewView: PreviewView
+) {
+    if (!uiState.isCameraRunning) {
+        Button(
+            onClick = { viewModel.startCamera(lifecycleOwner, previewView.surfaceProvider) },
+            colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF4CAF50))
+        ) {
+            Icon(Icons.Default.PlayArrow, contentDescription = null)
+            Spacer(modifier = Modifier.width(8.dp))
+            Text("Start")
+        }
+    } else {
+        Button(
+            onClick = { viewModel.stopCamera() },
+            colors = ButtonDefaults.buttonColors(containerColor = Color(0xFFF44336))
+        ) {
+            Icon(Icons.Default.Stop, contentDescription = null)
+            Spacer(modifier = Modifier.width(8.dp))
+            Text("Stop")
+        }
+    }
+}
+
+/** The mode-specific controls (Size / Speed / People), shared by both layouts. */
+@Composable
+private fun ModeControls(uiState: MeasureUiState, viewModel: MeasureViewModel) {
+    when (uiState.mode) {
+        MeasureMode.SIZE -> SizeControls(uiState = uiState, viewModel = viewModel)
+        MeasureMode.SPEED -> SpeedControls(uiState = uiState)
+        MeasureMode.PEOPLE -> PeopleControls(uiState = uiState, viewModel = viewModel)
+    }
+}
+
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun MeasureScreen(
@@ -91,7 +312,7 @@ fun MeasureScreen(
     val lifecycleOwner = LocalLifecycleOwner.current
     val context = LocalContext.current
 
-    var overlaySize by remember { mutableStateOf(IntSize.Zero) }
+    val overlaySize = remember { mutableStateOf(IntSize.Zero) }
     var showClearMemoryDialog by remember { mutableStateOf(false) }
 
     // Camera permission
@@ -137,189 +358,84 @@ fun MeasureScreen(
             )
         }
     ) { padding ->
-        Column(
+        BoxWithConstraints(
             modifier = Modifier
                 .fillMaxSize()
                 .padding(padding)
         ) {
-            // Mode toggle
-            MeasureModeToggle(
-                selected = uiState.mode,
-                onSelect = { viewModel.selectMode(it) },
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .padding(horizontal = 16.dp, vertical = 8.dp)
-            )
+            // Wide/landscape whenever the available width exceeds the height.
+            val isLandscape = maxWidth > maxHeight
 
-            Box(modifier = Modifier.fillMaxSize()) {
-                if (hasCameraPermission) {
-                    // Camera preview (with pinch-to-zoom in SPEED mode)
-                    val previewView = remember { PreviewView(context) }
-                    val isSpeed = uiState.mode == MeasureMode.SPEED
-                    Box(
-                        modifier = Modifier
-                            .fillMaxSize()
-                            .pointerInput(isSpeed) {
-                                if (!isSpeed) return@pointerInput
-                                detectTransformGestures { _, _, zoom, _ ->
-                                    if (uiState.isCameraRunning) {
-                                        viewModel.setZoom(uiState.zoomRatio * zoom)
-                                    }
-                                }
-                            }
-                    ) {
-                        AndroidView(
-                            factory = { previewView },
-                            modifier = Modifier.fillMaxSize()
-                        )
+            if (hasCameraPermission) {
+                // The PreviewView is created once and shared between the preview
+                // area and the Start button (which needs its surfaceProvider).
+                val previewView = remember { PreviewView(context) }
 
-                        // Contour overlay
-                        if (uiState.isCameraRunning) {
-                            uiState.contourBitmap?.let { bitmap ->
-                                val isSize = uiState.mode == MeasureMode.SIZE
-                                Image(
-                                    bitmap = bitmap.asImageBitmap(),
-                                    contentDescription = "Contour overlay",
-                                    // Crop-filled to match the PreviewView's FILL_CENTER;
-                                    // the bitmap is already rotated to the upright orientation.
-                                    contentScale = ContentScale.Crop,
-                                    modifier = Modifier
-                                        .fillMaxSize()
-                                        .onSizeChanged { overlaySize = it }
-                                        .pointerInput(
-                                            isSize,
-                                            uiState.mode,
-                                            uiState.detectedObjects.size,
-                                            uiState.selectedObjectIndex,
-                                            uiState.overlayRotationDegrees
-                                        ) {
-                                            detectTapGestures { offset ->
-                                                if (isSize) {
-                                                    viewModel.onObjectSelected(
-                                                        tapX = offset.x,
-                                                        tapY = offset.y,
-                                                        viewWidth = overlaySize.width,
-                                                        viewHeight = overlaySize.height,
-                                                        rotationDegrees = uiState.overlayRotationDegrees
-                                                    )
-                                                } else {
-                                                    viewModel.selectSpeedObject(
-                                                        tapX = offset.x,
-                                                        tapY = offset.y,
-                                                        viewWidth = overlaySize.width,
-                                                        viewHeight = overlaySize.height,
-                                                        rotationDegrees = uiState.overlayRotationDegrees
-                                                    )
-                                                }
-                                            }
-                                        }
-                                )
-                            }
-                        }
-
-                        // SPEED: per-object speed labels drawn over the overlay
-                        if (isSpeed && uiState.isCameraRunning) {
-                            SpeedObjectLabels(
-                                objects = uiState.detectedObjects,
-                                viewWidth = overlaySize.width,
-                                viewHeight = overlaySize.height,
-                                viewModel = viewModel
-                            )
-                        }
-
-                        // SPEED: zoom controls on the right
-                        if (isSpeed && uiState.isCameraRunning) {
-                            ZoomControls(
-                                zoomRatio = uiState.zoomRatio,
-                                maxZoomRatio = uiState.maxZoomRatio,
-                                onZoomIn = { viewModel.zoomIn() },
-                                onZoomOut = { viewModel.zoomOut() },
-                                modifier = Modifier
-                                    .align(Alignment.CenterEnd)
-                                    .padding(end = 16.dp)
-                            )
-                        }
-                    }
-
-                    // SPEED: live speed display overlay at the top
-                    if (isSpeed && uiState.isTracking && uiState.currentSpeed > 0.0) {
-                        SpeedOverlay(
-                            speed = uiState.currentSpeed,
-                            maxSpeed = uiState.maxSpeed,
-                            distance = uiState.totalDistance,
-                            elapsedSeconds = uiState.elapsedSeconds,
-                            calibrated = uiState.speedPixelsPerMm != null,
-                            modifier = Modifier.align(Alignment.TopCenter)
-                        )
-                    }
-
-                    // Bottom controls
-                    Column(
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .align(Alignment.BottomCenter)
-                            .background(Color.Black.copy(alpha = 0.8f))
-                            .padding(12.dp),
-                        horizontalAlignment = Alignment.CenterHorizontally
-                    ) {
-                        // Start / Stop
-                        Row(
-                            modifier = Modifier.fillMaxWidth(),
-                            horizontalArrangement = Arrangement.Center
+                if (isLandscape) {
+                    // Landscape: preview fills the left, controls in a sidebar on the right.
+                    Row(modifier = Modifier.fillMaxSize()) {
+                        Box(
+                            modifier = Modifier
+                                .weight(1f)
+                                .fillMaxHeight()
                         ) {
-                            if (!uiState.isCameraRunning) {
-                                Button(
-                                    onClick = {
-                                        val surfaceProvider = previewView.surfaceProvider
-                                        viewModel.startCamera(lifecycleOwner, surfaceProvider)
-                                    },
-                                    colors = ButtonDefaults.buttonColors(
-                                        containerColor = Color(0xFF4CAF50)
-                                    )
-                                ) {
-                                    Icon(Icons.Default.PlayArrow, contentDescription = null)
-                                    Spacer(modifier = Modifier.width(8.dp))
-                                    Text("Start")
-                                }
-                            } else {
-                                Button(
-                                    onClick = { viewModel.stopCamera() },
-                                    colors = ButtonDefaults.buttonColors(
-                                        containerColor = Color(0xFFF44336)
-                                    )
-                                ) {
-                                    Icon(Icons.Default.Stop, contentDescription = null)
-                                    Spacer(modifier = Modifier.width(8.dp))
-                                    Text("Stop")
-                                }
-                            }
+                            CameraPreviewArea(
+                                uiState = uiState,
+                                viewModel = viewModel,
+                                previewView = previewView,
+                                overlaySize = overlaySize
+                            )
                         }
-
-                        Spacer(modifier = Modifier.height(10.dp))
-
-                        if (uiState.mode == MeasureMode.SIZE) {
-                            SizeControls(uiState = uiState, viewModel = viewModel)
-                        } else {
-                            SpeedControls(uiState = uiState, viewModel = viewModel)
-                        }
+                        ControlsSidebar(
+                            uiState = uiState,
+                            viewModel = viewModel,
+                            lifecycleOwner = lifecycleOwner,
+                            previewView = previewView
+                        )
                     }
                 } else {
-                    // Permission not granted
-                    Column(
-                        modifier = Modifier
-                            .fillMaxSize()
-                            .padding(32.dp),
-                        verticalArrangement = Arrangement.Center,
-                        horizontalAlignment = Alignment.CenterHorizontally
-                    ) {
-                        Text(
-                            "Camera permission is required to measure.",
-                            style = MaterialTheme.typography.bodyLarge
+                    // Portrait: mode toggle on top, preview in the middle, controls at the bottom.
+                    Column(modifier = Modifier.fillMaxSize()) {
+                        MeasureModeToggle(
+                            selected = uiState.mode,
+                            onSelect = { viewModel.selectMode(it) },
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .padding(horizontal = 16.dp, vertical = 8.dp)
                         )
-                        Spacer(modifier = Modifier.height(16.dp))
-                        Button(onClick = { permissionLauncher.launch(Manifest.permission.CAMERA) }) {
-                            Text("Grant Permission")
+                        Box(modifier = Modifier.fillMaxSize()) {
+                            CameraPreviewArea(
+                                uiState = uiState,
+                                viewModel = viewModel,
+                                previewView = previewView,
+                                overlaySize = overlaySize
+                            )
+                            ControlsBar(
+                                uiState = uiState,
+                                viewModel = viewModel,
+                                lifecycleOwner = lifecycleOwner,
+                                previewView = previewView,
+                                modifier = Modifier.align(Alignment.BottomCenter)
+                            )
                         }
+                    }
+                }
+            } else {
+                // Permission not granted
+                Column(
+                    modifier = Modifier
+                        .fillMaxSize()
+                        .padding(32.dp),
+                    verticalArrangement = Arrangement.Center,
+                    horizontalAlignment = Alignment.CenterHorizontally
+                ) {
+                    Text(
+                        "Camera permission is required to measure.",
+                        style = MaterialTheme.typography.bodyLarge
+                    )
+                    Spacer(modifier = Modifier.height(16.dp))
+                    Button(onClick = { permissionLauncher.launch(Manifest.permission.CAMERA) }) {
+                        Text("Grant Permission")
                     }
                 }
             }
@@ -337,19 +453,7 @@ fun MeasureScreen(
         )
     }
 
-    // Calibration dialog (SPEED) — sets the pixels/mm scale so speed/distance
-    // can be reported in real units (m/s, m) instead of raw pixels. Only a single
-    // length is needed, so the height field stays hidden.
-    if (uiState.mode == MeasureMode.SPEED && uiState.showSpeedCalibrationDialog) {
-        CalibrationDialog(
-            pixelWidth = uiState.speedCalibrationPixelX,
-            pixelHeight = null,
-            onDismiss = { viewModel.dismissSpeedCalibrationDialog() },
-            onCalibrate = { w, _ -> viewModel.setSpeedCalibration(w) }
-        )
-    }
-
-    // Label dialog after capture/track (both modes)
+    // Label dialog after capture (SIZE mode only — SPEED has no save flow)
     if (uiState.showLabelDialog) {
         LabelDialog(
             onDismiss = { viewModel.dismissLabelDialog() },
@@ -413,6 +517,14 @@ private fun MeasureModeToggle(
             icon = Icons.Default.Speed,
             selected = selected == MeasureMode.SPEED,
             onClick = { onSelect(MeasureMode.SPEED) },
+            modifier = Modifier.weight(1f)
+        )
+        Spacer(modifier = Modifier.width(8.dp))
+        ModeButton(
+            label = "People",
+            icon = Icons.Default.Person,
+            selected = selected == MeasureMode.PEOPLE,
+            onClick = { onSelect(MeasureMode.PEOPLE) },
             modifier = Modifier.weight(1f)
         )
     }
@@ -528,27 +640,12 @@ private fun SizeControls(uiState: MeasureUiState, viewModel: MeasureViewModel) {
 // ---------------------------------------------------------------- SPEED controls
 
 @Composable
-private fun SpeedControls(uiState: MeasureUiState, viewModel: MeasureViewModel) {
-    // Save button (shown while tracking)
-    if (uiState.isTracking) {
-        Button(
-            onClick = { viewModel.stopTrackingAndSave() },
-            colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF2196F3))
-        ) {
-            Icon(Icons.Default.Stop, contentDescription = null)
-            Spacer(modifier = Modifier.width(4.dp))
-            Text("Save")
-        }
-    }
-
+private fun SpeedControls(uiState: MeasureUiState) {
     Spacer(modifier = Modifier.height(8.dp))
 
     if (uiState.isCameraRunning && !uiState.isTracking) {
         Text(
-            text = if (uiState.speedPixelsPerMm == null)
-                "Tap the object you want to track, then enter its real size"
-            else
-                "Tap an object to measure its speed, or wait to auto-track",
+            text = "Tap a moving object to check its speed",
             style = MaterialTheme.typography.bodyMedium,
             color = Color(0xFFAAAAAA)
         )
@@ -569,6 +666,68 @@ private fun SpeedControls(uiState: MeasureUiState, viewModel: MeasureViewModel) 
             text = "Press Start to begin",
             style = MaterialTheme.typography.bodyMedium,
             color = Color(0xFFAAAAAA)
+        )
+    }
+}
+
+// ---------------------------------------------------------------- PEOPLE controls
+
+@Composable
+private fun PeopleControls(uiState: MeasureUiState, viewModel: MeasureViewModel) {
+    // Live face count — large and prominent so it's readable over the camera.
+    Text(
+        text = "${uiState.peopleCount}",
+        style = MaterialTheme.typography.displaySmall,
+        fontWeight = FontWeight.Bold,
+        color = Color(0xFF4CAF50)
+    )
+    Text(
+        text = if (uiState.peopleCount == 1) "person" else "people",
+        style = MaterialTheme.typography.bodyMedium,
+        color = Color(0xFFAAAAAA)
+    )
+
+    Spacer(modifier = Modifier.height(10.dp))
+
+    Row(
+        modifier = Modifier.fillMaxWidth(),
+        horizontalArrangement = Arrangement.Center
+    ) {
+        Button(
+            onClick = { viewModel.savePeopleCount() },
+            colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF2196F3))
+        ) {
+            Text("Save count")
+        }
+    }
+}
+
+@Composable
+private fun PeopleOverlay(count: Int, modifier: Modifier = Modifier) {
+    Column(
+        modifier = modifier
+            .fillMaxWidth()
+            .padding(12.dp)
+            .background(Color.Black.copy(alpha = 0.7f), RoundedCornerShape(12.dp))
+            .padding(12.dp),
+        horizontalAlignment = Alignment.CenterHorizontally
+    ) {
+        Icon(
+            Icons.Default.Person,
+            contentDescription = null,
+            tint = Color(0xFF4CAF50),
+            modifier = Modifier.size(28.dp)
+        )
+        Text(
+            text = "$count ${if (count == 1) "person" else "people"}",
+            style = MaterialTheme.typography.headlineMedium,
+            fontWeight = FontWeight.Bold,
+            color = Color.White
+        )
+        Text(
+            text = "detected",
+            style = MaterialTheme.typography.bodySmall,
+            color = Color(0xFF888888)
         )
     }
 }
@@ -730,13 +889,12 @@ private fun SpeedOverlay(
     maxSpeed: Double,
     distance: Double,
     elapsedSeconds: Double,
-    /** True once SPEED calibration has set a real-world scale. */
+    /** True when SPEED reuses a SIZE-mode plane calibration for real units. */
     calibrated: Boolean,
     modifier: Modifier = Modifier
 ) {
-    // Until calibration, values are raw pixels — label them honestly as px/s,
-    // px rather than pretending they are metric. After calibration they are
-    // m/s and m.
+    // When a SIZE plane calibration is live, SPEED converts to m/s + m via the
+    // homography; otherwise values stay raw pixels (px/s + px).
     val speedUnit = if (calibrated) "m/s" else "px/s"
     val distUnit = if (calibrated) "m" else "px"
     Column(
@@ -790,9 +948,12 @@ private fun SpeedObjectLabels(
     objects: List<MeasureDetectedObject>,
     viewWidth: Int,
     viewHeight: Int,
+    /** True when SPEED reuses a SIZE-mode plane calibration for real units. */
+    calibrated: Boolean,
     viewModel: MeasureViewModel
 ) {
     val density = LocalContext.current.resources.displayMetrics.density
+    val unit = if (calibrated) "m/s" else "px/s"
     Box(modifier = Modifier.fillMaxSize()) {
         objects.forEach { obj ->
             if (obj.isMoving && obj.speed > 0.0) {
@@ -825,7 +986,7 @@ private fun SpeedObjectLabels(
                             .padding(horizontal = 6.dp, vertical = 2.dp)
                     ) {
                         Text(
-                            text = "$tag${"%.0f".format(obj.speed)} px/s",
+                            text = "$tag${"%.1f".format(obj.speed)} $unit",
                             color = labelColor,
                             fontWeight = FontWeight.Bold,
                             fontSize = 12.sp

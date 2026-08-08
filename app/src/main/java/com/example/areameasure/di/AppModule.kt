@@ -4,8 +4,10 @@ import android.content.Context
 import androidx.room.Room
 import com.example.areameasure.data.local.AppDatabase
 import com.example.areameasure.data.local.MeasurementDao
+import com.example.areameasure.data.local.PeopleCountDao
 import com.example.areameasure.data.local.SpeedDao
 import com.example.areameasure.data.repository.MeasurementRepository
+import com.example.areameasure.data.repository.PeopleCountRepository
 import com.example.areameasure.data.repository.SpeedRepository
 import com.example.areameasure.processing.ImageProcessor
 import dagger.Module
@@ -26,7 +28,9 @@ object AppModule {
             context,
             AppDatabase::class.java,
             "area_measure_db"
-        ).build()
+        )
+            .fallbackToDestructiveMigration()
+            .build()
     }
 
     @Provides
@@ -43,6 +47,12 @@ object AppModule {
 
     @Provides
     @Singleton
+    fun providePeopleCountDao(database: AppDatabase): PeopleCountDao {
+        return database.peopleCountDao()
+    }
+
+    @Provides
+    @Singleton
     fun provideMeasurementRepository(dao: MeasurementDao): MeasurementRepository {
         return MeasurementRepository(dao)
     }
@@ -51,6 +61,12 @@ object AppModule {
     @Singleton
     fun provideSpeedRepository(dao: SpeedDao): SpeedRepository {
         return SpeedRepository(dao)
+    }
+
+    @Provides
+    @Singleton
+    fun providePeopleCountRepository(dao: PeopleCountDao): PeopleCountRepository {
+        return PeopleCountRepository(dao)
     }
 
     @Provides

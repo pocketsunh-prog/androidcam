@@ -91,6 +91,10 @@ fun DetailScreen(
                         measurement = measurement.measurement,
                         modifier = Modifier.padding(padding)
                     )
+                    is DetailMeasurement.People -> PeopleDetailContent(
+                        measurement = measurement.measurement,
+                        modifier = Modifier.padding(padding)
+                    )
                 }
             } ?: Text(
                 "Measurement not found",
@@ -240,6 +244,58 @@ private fun SpeedDetailContent(
         DetailRow("Object name", measurement.objectLabel)
         DetailRow("Distance", "${"%.2f".format(measurement.distanceMeters)} m")
         DetailRow("Duration", "${"%.1f".format(measurement.durationSeconds)} s")
+        DetailRow("Measured on", dateFormat.format(Date(measurement.timestamp)))
+    }
+}
+
+@Composable
+private fun PeopleDetailContent(
+    measurement: com.example.areameasure.data.model.PeopleCountMeasurement,
+    modifier: Modifier = Modifier
+) {
+    val dateFormat = remember {
+        SimpleDateFormat("EEEE, MMMM d, yyyy 'at' h:mm:ss a", Locale.getDefault())
+    }
+
+    Column(
+        modifier = modifier
+            .fillMaxSize()
+            .verticalScroll(rememberScrollState())
+            .padding(16.dp)
+    ) {
+        measurement.imagePath?.let { path ->
+            AsyncImage(
+                model = File(path),
+                contentDescription = "People snapshot",
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .height(250.dp),
+                contentScale = ContentScale.Fit
+            )
+            Spacer(modifier = Modifier.height(16.dp))
+        }
+
+        Text(
+            text = "People detected",
+            style = MaterialTheme.typography.labelLarge,
+            color = MaterialTheme.colorScheme.onSurfaceVariant
+        )
+        Text(
+            text = "${measurement.count}",
+            style = MaterialTheme.typography.displayMedium,
+            color = Color(0xFF4CAF50)
+        )
+        Text(
+            text = if (measurement.count == 1) "person" else "people",
+            style = MaterialTheme.typography.titleMedium,
+            color = Color(0xFF81C784)
+        )
+
+        Spacer(modifier = Modifier.height(16.dp))
+        HorizontalDivider()
+        Spacer(modifier = Modifier.height(16.dp))
+
+        DetailRow("Count", "${measurement.count}")
         DetailRow("Measured on", dateFormat.format(Date(measurement.timestamp)))
     }
 }
