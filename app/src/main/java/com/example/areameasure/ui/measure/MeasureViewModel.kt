@@ -22,6 +22,8 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 import org.opencv.core.Point
+import org.opencv.core.Rect
+import org.opencv.imgproc.Imgproc
 import javax.inject.Inject
 
 /**
@@ -50,23 +52,6 @@ data class Dimensions3D(
     val x: Double,
     val y: Double,
     val z: Double
-)
-
-/**
- * Live tracking state for one moving object (SPEED mode). Position/speed are
- * accumulated frame-to-frame; [contourIndex] is refreshed each frame from the
- * nearest detected contour so a track survives index reassignments.
- */
-private data class TrackedObject(
-    val id: Int,
-    var contourIndex: Int,
-    var lastPosition: Point,
-    /** Previous frame's ground-contact point (feet), used for metric displacement. */
-    var lastGroundPoint: Point,
-    var smoothedSpeed: Double,
-    var lastFrameTimeMs: Long,
-    var lastMovementTimeMs: Long,
-    var totalDistance: Double
 )
 
 data class MeasureUiState(
@@ -117,12 +102,15 @@ data class MeasureUiState(
     val zoomRatio: Float = 1.0f,
     val maxZoomRatio: Float = 1.0f,
     /**
-     * True while SPEED mode can convert pixels to real-world units using the
-     * active SIZE-mode plane calibration (homography). When true, speed and
+     * True while SPEED mode can convert pixels to real-world units, either via
+     * the active SIZE-mode plane calibration (homography) or via a SPEED-mode
+     * reference-length calibration (pixels per metre). When true, speed and
      * distance are reported in m/s and m; when false they fall back to px/s
-     * and px. SPEED reuses the SIZE calibration rather than having its own.
+     * and px.
      */
     val speedUsesMetric: Boolean = false,
+    /** True while the SPEED reference-length calibration dialog is shown. */
+    val showSpeedCalibrationDialog: Boolean = false,
     /**
      * Clockwise rotation (a multiple of 90°) applied to the raw analysis frame
      * so the contour overlay matches the upright preview. The raw frame is
@@ -171,44 +159,65 @@ class MeasureViewModel @Inject constructor(
         selectedContour = null
     }
 
+    /**
+     * SPEED-mode scale factor: how many pixels equal one metre, derived from a
+     * user-entered reference length. null until the user calibrates. When the
+     * SIZE plane calibration is also present, that homography takes precedence
+     * (it corrects for perspective); this simple factor is the fallback.
+     */
+    private var speedPixelsPerMeter: Double? = null
+
+    /** True when SPEED can convert pixel displacement to real-world metres. */
+    private fun hasMetricScale(): Boolean = sizeCalibration != null || speedPixelsPerMeter != null
+
     // --- SPEED tracking state ---
 
     /**
-     * Per-object speed tracking, keyed by a stable track id (not the frame-local
-     * contour index, which can change between frames). Each entry accumulates
-     * displacement and speed for one independently moving object.
+     * Contour index the user pinned to measure speed (-1 = none). Speed is now
+     * measured for this single target only, using a visual tracker (see
+     * ImageProcessor.speedTracker) whose bounding-box centre is far more stable
+     * than raw contour centroids.
      */
-    private val trackedObjects = mutableMapOf<Int, TrackedObject>()
+    private var pinnedContourIndex: Int = -1
 
-    /** Monotonic id source for new tracks. */
-    private var nextTrackId: Int = 0
+    /** Contour indices currently detected as moving (used only to mark them). */
+    private var movingContourIndices: Set<Int> = emptySet()
 
-    /**
-     * Stable id of the track the user tapped to pin for speed tracking (-1 = none).
-     * Keyed on the stable track id rather than the frame-local contour index,
-     * which can be reassigned between frames. A pinned track keeps measuring its
-     * object's speed even when it momentarily stops, so long as it stays in frame.
-     */
-    private var pinnedTrackId: Int = -1
+    /** Smoothed speed of the pinned target (px/s or m/s depending on calibration). */
+    private var pinnedSpeed: Double = 0.0
 
-    /** When the first object in the current tracking burst started moving. */
+    /** Accumulated distance of the pinned target in the current unit. */
+    private var pinnedDistance: Double = 0.0
+
+    /** Sensor timestamp of the last frame that contributed to the pinned speed. */
+    private var lastPinnedTimeMs: Long = 0L
+
+    /** Previous ground-contact point (pixels) for the plane-homography metric path. */
+    private var lastPinnedGroundPointPx: Point? = null
+
+    /** When the current tracking session started (for elapsed time display). */
     private var trackingStartTimeMs: Long = 0L
 
     private var prevObjects: List<ImageProcessor.DetectedObject> = emptyList()
     /** Timestamp when the camera most recently started (for the settle delay). */
     private var cameraStartedAtMs: Long = 0L
 
+    /** Rolling window of recent raw face counts, used to stabilise the live count. */
+    private val peopleCountHistory = mutableListOf<Int>()
+
     /** Switch between Size and Speed measurement. Stops the camera if running. */
     fun selectMode(mode: MeasureMode) {
         if (mode == _uiState.value.mode) return
         // Clear speed tracking state on any mode switch — tracks and the user pin
         // are specific to SPEED mode and must not leak into SIZE mode.
-        trackedObjects.clear()
-        pinnedTrackId = -1
+        clearSpeedPin()
+        peopleCountHistory.clear()
         if (_uiState.value.isCameraRunning) stopCamera()
         // The SIZE plane calibration (homography) is NOT dropped on mode switch:
         // SPEED mode reuses it to convert pixels → metres. Only reset()/stopCamera()
         // clear it. [isCalibrated] reflects whether that calibration still exists.
+        // The SPEED-only reference-length scale is mode-specific and is dropped.
+        speedPixelsPerMeter = null
         cameraManager.measureMode = mode
         _uiState.update {
             it.copy(
@@ -223,12 +232,13 @@ class MeasureViewModel @Inject constructor(
                 isCalibrated = sizeCalibration != null,
                 calibrationWidthMm = sizeCalibration?.referenceWidthMm,
                 calibrationHeightMm = sizeCalibration?.referenceHeightMm,
-                speedUsesMetric = sizeCalibration != null,
+                speedUsesMetric = hasMetricScale(),
                 dimensions = null,
                 selectedPixelX = null,
                 selectedPixelY = null,
                 selectedPixelZ = null,
                 showCalibrationDialog = false,
+                showSpeedCalibrationDialog = false,
                 isCapturing = false,
                 peopleCount = 0
             )
@@ -244,6 +254,7 @@ class MeasureViewModel @Inject constructor(
                 .onSuccess { camera ->
                     val maxZoom = camera.cameraInfo.zoomState.value?.maxZoomRatio ?: 1.0f
                     cameraStartedAtMs = System.currentTimeMillis()
+                    peopleCountHistory.clear()
                     _uiState.update {
                         it.copy(
                             isCameraRunning = true,
@@ -265,7 +276,7 @@ class MeasureViewModel @Inject constructor(
         processingCollectionJob?.cancel()
         processingCollectionJob = null
         prevObjects = emptyList()
-        pinnedTrackId = -1
+        movingContourIndices = emptySet()
         cameraStartedAtMs = 0L
         _uiState.update {
             it.copy(
@@ -292,6 +303,7 @@ class MeasureViewModel @Inject constructor(
     fun reset() {
         stopCamera()
         clearSizeCalibration()
+        speedPixelsPerMeter = null
         _uiState.update {
             it.copy(
                 selectedObjectIndex = -1,
@@ -309,6 +321,7 @@ class MeasureViewModel @Inject constructor(
                 elapsedSeconds = 0.0,
                 speedUsesMetric = false,
                 showCalibrationDialog = false,
+                showSpeedCalibrationDialog = false,
                 isCapturing = false,
                 lastCapturedImagePath = null,
                 peopleCount = 0
@@ -371,13 +384,10 @@ class MeasureViewModel @Inject constructor(
                     MeasureMode.SIZE -> { /* dimensions computed below */ }
                 }
 
-                // Map each detected contour to its live tracking session (if any)
-                // so the overlay can show a per-object speed and highlight it.
-                val trackByContour: Map<Int, TrackedObject> =
-                    trackedObjects.values.associateBy { it.contourIndex }
-
+                // Map each detected contour to its live status so the overlay can
+                // mark moving objects and show the pinned target's speed.
                 val selectableObjects = result.detectedObjects.map { obj ->
-                    val track = trackByContour[obj.contourIndex]
+                    val isPinned = obj.contourIndex == pinnedContourIndex
                     MeasureDetectedObject(
                         contourIndex = obj.contourIndex,
                         centerX = obj.center.x.toFloat(),
@@ -386,10 +396,10 @@ class MeasureViewModel @Inject constructor(
                         pixelHeight = obj.pixelHeight.toFloat(),
                         pixelDepth = obj.pixelDepth.toFloat(),
                         angle = obj.angle.toFloat(),
-                        isSelected = obj.contourIndex == _uiState.value.selectedObjectIndex,
-                        isMoving = track != null,
-                        isTracked = track != null,
-                        speed = track?.smoothedSpeed ?: 0.0
+                        isSelected = isPinned,
+                        isMoving = obj.contourIndex in movingContourIndices,
+                        isTracked = isPinned,
+                        speed = if (isPinned) pinnedSpeed else 0.0
                     )
                 }
 
@@ -434,7 +444,7 @@ class MeasureViewModel @Inject constructor(
                         isCalibrated = sizeCalibration != null,
                         calibrationWidthMm = sizeCalibration?.referenceWidthMm,
                         calibrationHeightMm = sizeCalibration?.referenceHeightMm,
-                        speedUsesMetric = sizeCalibration != null
+                        speedUsesMetric = hasMetricScale()
                     )
                 }
             }
@@ -499,13 +509,12 @@ class MeasureViewModel @Inject constructor(
     /**
      * Handle a tap on the camera preview in SPEED mode: pin the nearest MOVING
      * object so its speed is tracked and shown on demand. Only objects that are
-     * currently moving (i.e. have an active track from motion detection) can be
-     * selected — tapping a stationary object is ignored. Tapping the same pinned
-     * object again (or empty space) clears the pin. The pinned object keeps a
-     * live track even when it momentarily stops, so long as it stays in frame.
+     * currently moving can be selected — tapping a stationary object is ignored.
+     * Tapping the same pinned object again (or empty space) clears the pin.
      *
-     * SPEED mode has no calibration step and no relation to area/size: it reads
-     * speed and distance straight in pixels.
+     * Once pinned, the object is tracked with a visual tracker so its speed is
+     * measured from a stable bounding-box centre rather than a jittery contour
+     * centroid.
      */
     fun selectSpeedObject(
         tapX: Float,
@@ -531,11 +540,9 @@ class MeasureViewModel @Inject constructor(
         var closestIndex = -1
         var closestDistance = Double.MAX_VALUE
 
-        // Only objects with an active moving track are selectable for speed.
-        val trackByContour: Map<Int, TrackedObject> =
-            trackedObjects.values.associateBy { it.contourIndex }
+        // Only moving objects are selectable for speed.
         state.detectedObjects.forEach { obj ->
-            if (trackByContour[obj.contourIndex] == null) return@forEach
+            if (!obj.isMoving) return@forEach
             val dx = frameX - obj.centerX
             val dy = frameY - obj.centerY
             val dist = kotlin.math.sqrt((dx * dx + dy * dy).toDouble())
@@ -546,66 +553,64 @@ class MeasureViewModel @Inject constructor(
             }
         }
 
-        val pinnedTrack = trackedObjects[pinnedTrackId]
-
         // Toggle: tapping the currently-pinned object again clears it.
-        if (closestIndex >= 0 && pinnedTrack != null && pinnedTrack.contourIndex == closestIndex) {
-            trackedObjects.remove(pinnedTrackId)
-            pinnedTrackId = -1
-            _uiState.update { it.copy(selectedObjectIndex = -1) }
+        if (closestIndex >= 0 && closestIndex == pinnedContourIndex) {
+            clearSpeedPin()
             return
         }
 
         if (closestIndex >= 0) {
-            // Drop any previous pin before setting the new one.
-            if (pinnedTrack != null) {
-                trackedObjects.remove(pinnedTrackId)
-            }
-            // Ensure a live track exists for the pinned object so its speed is
-            // measured even if it isn't currently moving enough to auto-track.
-            val id = ensurePinnedTrack(state.detectedObjects, closestIndex)
-            pinnedTrackId = id
-            _uiState.update { it.copy(selectedObjectIndex = closestIndex) }
+            pinSpeedTarget(closestIndex)
         } else {
             // Tapped empty space (or a stationary object) — clear the pin.
-            pinnedTrackId = -1
-            _uiState.update { it.copy(selectedObjectIndex = -1) }
+            clearSpeedPin()
         }
     }
 
-    /**
-     * Guarantee a live track exists for [contourIndex], seeding it from the
-     * matching detected object. Returns the track's stable id (existing or new).
-     * If no matching object is found, returns -1 and leaves tracking unchanged.
-     */
-    private fun ensurePinnedTrack(
-        detectedObjects: List<MeasureDetectedObject>,
-        contourIndex: Int
-    ): Int {
-        val existing = trackedObjects.entries
-            .firstOrNull { it.value.contourIndex == contourIndex }?.key
-        if (existing != null) return existing
+    /** Pin [contourIndex] and seed the visual tracker from its bounding box. */
+    private fun pinSpeedTarget(contourIndex: Int) {
+        // Seed the tracker with the detected object's upright bounding box.
+        // If the object is no longer in the last frame, abort rather than pin
+        // with no tracker.
+        val targetObj = prevObjects.firstOrNull { it.contourIndex == contourIndex }
+            ?: return
+        val seedRect = Imgproc.boundingRect(targetObj.contour)
 
-        val obj = detectedObjects.firstOrNull { it.contourIndex == contourIndex } ?: return -1
-        val now = System.currentTimeMillis()
-        if (trackedObjects.isEmpty()) trackingStartTimeMs = now
-        val id = nextTrackId++
-        val centerPoint = org.opencv.core.Point(obj.centerX.toDouble(), obj.centerY.toDouble())
-        trackedObjects[id] = TrackedObject(
-            id = id,
-            contourIndex = contourIndex,
-            // MeasureDetectedObject center is in raw-frame pixels as Float.
-            lastPosition = centerPoint,
-            // No contour here (UI model only): seed the ground point at the
-            // center. It is corrected to the true ground-contact point on the
-            // first frame that has a full DetectedObject to measure.
-            lastGroundPoint = centerPoint,
-            smoothedSpeed = 0.0,
-            lastFrameTimeMs = now,
-            lastMovementTimeMs = now,
-            totalDistance = 0.0
-        )
-        return id
+        pinnedContourIndex = contourIndex
+        pinnedSpeed = 0.0
+        pinnedDistance = 0.0
+        lastPinnedTimeMs = 0L
+        lastPinnedGroundPointPx = null
+        trackingStartTimeMs = 0L
+
+        cameraManager.setTargetContourIndex(contourIndex)
+        cameraManager.setSpeedTargetRect(seedRect)
+        _uiState.update {
+            it.copy(
+                selectedObjectIndex = contourIndex,
+                isTracking = true,
+                currentSpeed = 0.0,
+                maxSpeed = 0.0,
+                totalDistance = 0.0,
+                elapsedSeconds = 0.0
+            )
+        }
+    }
+
+    /** Clear the pinned target, its tracker and the live speed readout. */
+    private fun clearSpeedPin() {
+        pinnedContourIndex = -1
+        pinnedSpeed = 0.0
+        pinnedDistance = 0.0
+        lastPinnedTimeMs = 0L
+        lastPinnedGroundPointPx = null
+        trackingStartTimeMs = 0L
+
+        cameraManager.setSpeedTargetRect(null)
+        cameraManager.setTargetContourIndex(-1)
+        _uiState.update {
+            it.copy(selectedObjectIndex = -1, isTracking = false, currentSpeed = 0.0)
+        }
     }
 
     /**
@@ -639,6 +644,32 @@ class MeasureViewModel @Inject constructor(
 
     fun showCalibrationDialog() {
         _uiState.update { it.copy(showCalibrationDialog = true) }
+    }
+
+    fun showSpeedCalibrationDialog() {
+        _uiState.update { it.copy(showSpeedCalibrationDialog = true) }
+    }
+
+    fun dismissSpeedCalibrationDialog() {
+        _uiState.update { it.copy(showSpeedCalibrationDialog = false) }
+    }
+
+    /**
+     * Calibrate SPEED mode from the pinned object's real-world length. Uses the
+     * object's longer bounding-box edge (in pixels) as the reference, producing a
+     * pixels-per-metre scale so speed/distance are reported in m/s and m.
+     */
+    fun setSpeedCalibration(referenceLengthMm: Double) {
+        if (referenceLengthMm <= 0.0) return
+        if (pinnedContourIndex < 0) return
+        val obj = prevObjects.firstOrNull { it.contourIndex == pinnedContourIndex } ?: return
+        val pixelLength = obj.pixelWidth
+        if (pixelLength <= 0.0) return
+
+        speedPixelsPerMeter = pixelLength / (referenceLengthMm / 1000.0)
+        _uiState.update {
+            it.copy(showSpeedCalibrationDialog = false, speedUsesMetric = true)
+        }
     }
 
     fun setUnit(unit: UnitOfMeasure) {
@@ -715,106 +746,29 @@ class MeasureViewModel @Inject constructor(
         }
 
         // Ignore motion for a short window after the camera starts so handshake
-        // jitter doesn't get mistaken for a moving object. This lets the user
-        // steady the phone before tracking engages.
+        // jitter doesn't get mistaken for a moving object.
         val settled = now - cameraStartedAtMs >= SETTLE_DELAY_MS
 
-        if (settled) {
-            updateMultiObjectTracking(result, now)
+        movingContourIndices = if (settled) {
+            detectMovingObjects(result.detectedObjects).map { it.obj.contourIndex }.toSet()
+        } else {
+            emptySet()
         }
+
+        // Speed comes from the visual tracker (see ImageProcessor), whose
+        // bounding-box centre is far more stable than a raw contour centroid.
+        if (settled && pinnedContourIndex >= 0 && result.speedTrackActive) {
+            updatePinnedSpeed(result.speedDisplacementPx, result.speedTrackRect, now)
+        }
+
+        // Mark only moving contours plus the pinned target.
+        val marked = movingContourIndices.toMutableSet()
+        if (pinnedContourIndex >= 0) marked.add(pinnedContourIndex)
+        cameraManager.setMarkedContourIndices(marked)
+        cameraManager.setTargetContourIndex(if (pinnedContourIndex >= 0) pinnedContourIndex else -1)
 
         updateAggregateSpeedState(now)
         prevObjects = result.detectedObjects
-    }
-
-    /**
-     * Track several moving objects at once. Each frame, every object that moved
-     * clearly more than the background is greedily matched to the nearest
-     * existing track (or spawns a new one); tracks that stop moving time out.
-     */
-    private fun updateMultiObjectTracking(
-        result: ImageProcessor.ProcessingResult,
-        now: Long
-    ) {
-        val currentObjects = result.detectedObjects
-        val moving = detectMovingObjects(currentObjects)
-
-        // Greedy nearest match of existing tracks to moving detections so two
-        // tracks never claim the same object.
-        val matchedTrackIds = mutableSetOf<Int>()
-        val matchedMoving = mutableSetOf<Int>() // indices into [moving]
-        val candidates = mutableListOf<Triple<Double, Int, Int>>() // (dist, trackId, movingIndex)
-        for ((id, track) in trackedObjects) {
-            moving.forEachIndexed { i, m ->
-                candidates.add(
-                    Triple(
-                        distance(track.lastPosition.x, track.lastPosition.y, m.obj.center.x, m.obj.center.y),
-                        id,
-                        i
-                    )
-                )
-            }
-        }
-        candidates.sortBy { it.first }
-        for ((dist, id, mi) in candidates) {
-            if (dist > MAX_DISPLACEMENT_PX) break
-            if (id in matchedTrackIds || mi in matchedMoving) continue
-            matchedTrackIds.add(id)
-            matchedMoving.add(mi)
-            updateTrack(trackedObjects[id]!!, moving[mi].obj, now)
-        }
-
-        // Spawn a fresh track for each moving detection that went unmatched.
-        moving.forEachIndexed { i, m ->
-            if (i in matchedMoving) return@forEachIndexed
-            if (trackedObjects.isEmpty()) trackingStartTimeMs = now
-            val id = nextTrackId++
-            trackedObjects[id] = TrackedObject(
-                id = id,
-                contourIndex = m.obj.contourIndex,
-                lastPosition = m.obj.center,
-                lastGroundPoint = groundPoint(m.obj),
-                smoothedSpeed = 0.0,
-                lastFrameTimeMs = now,
-                lastMovementTimeMs = now,
-                totalDistance = 0.0
-            )
-        }
-
-        // Tracks not matched to a moving object: follow the object if it's still
-        // nearby (so the label sticks to it), otherwise let it time out — except
-        // for a pinned track, which the user explicitly selected and which must
-        // persist (and keep following) until cleared.
-        val stale = mutableListOf<Int>()
-        for ((id, track) in trackedObjects) {
-            if (id in matchedTrackIds) continue
-            val isPinned = id == pinnedTrackId
-            val nearest = currentObjects.minByOrNull {
-                distance(track.lastPosition.x, track.lastPosition.y, it.center.x, it.center.y)
-            }
-            val followDist = nearest?.let {
-                distance(track.lastPosition.x, track.lastPosition.y, it.center.x, it.center.y)
-            } ?: Double.MAX_VALUE
-            if (followDist <= MAX_DISPLACEMENT_PX) {
-                // Still present but below motion threshold — follow without gaining speed.
-                track.contourIndex = nearest!!.contourIndex
-                track.lastPosition = nearest.center
-                if (!isPinned) {
-                    track.smoothedSpeed = 0.0
-                }
-            }
-            // A pinned track never times out and keeps its last known speed so the
-            // readout stays live even while the object is momentarily still.
-            if (!isPinned && now - track.lastMovementTimeMs > SPEED_RESET_TIMEOUT_MS) {
-                stale.add(id)
-            }
-        }
-        stale.forEach { trackedObjects.remove(it) }
-
-        // Prefer the pinned object for the contour highlight; otherwise the fastest.
-        val primary = trackedObjects[pinnedTrackId]
-            ?: trackedObjects.values.maxByOrNull { it.smoothedSpeed }
-        cameraManager.setTargetContourIndex(primary?.contourIndex ?: -1)
     }
 
     /** A current detection paired with its frame-to-frame displacement. */
@@ -825,7 +779,8 @@ class MeasureViewModel @Inject constructor(
 
     /**
      * Return every current object whose displacement from its nearest previous
-     * counterpart exceeds the background (median) motion by the threshold.
+     * counterpart exceeds the background (median) motion by the threshold. Used
+     * only to mark moving objects — not to measure speed.
      */
     private fun detectMovingObjects(currentObjects: List<ImageProcessor.DetectedObject>): List<MovingDetection> {
         if (prevObjects.isEmpty()) return emptyList()
@@ -849,82 +804,73 @@ class MeasureViewModel @Inject constructor(
         return matches.filter { it.displacement in cutoff..MAX_DISPLACEMENT_PX }
     }
 
-    /** Accumulate displacement/speed for one matched track against its object. */
-    private fun updateTrack(track: TrackedObject, obj: ImageProcessor.DetectedObject, now: Long) {
-        val displacementPx = distance(track.lastPosition.x, track.lastPosition.y, obj.center.x, obj.center.y)
-        track.contourIndex = obj.contourIndex
-        track.lastPosition = obj.center
-        track.lastFrameTimeMs = now
-        if (displacementPx in MOVING_THRESHOLD_PX..MAX_DISPLACEMENT_PX) {
-            val timeDelta = now - track.lastMovementTimeMs
-            // Convert the frame-to-frame displacement to a real-world distance.
-            // When a SIZE-mode plane calibration exists, transform the object's
-            // ground-contact points through the homography to get displacement in
-            // mm on the reference plane, then to metres (m/s). Otherwise fall
-            // back to raw pixels (px/s) — no scale available.
-            val displacementM = sizeCalibration?.let { cal ->
-                val prevMm = PerspectiveCalibration.transformPoint(cal, track.lastGroundPoint)
-                val curGround = groundPoint(obj)
-                val curMm = PerspectiveCalibration.transformPoint(cal, curGround)
-                val dMm = distance(prevMm.x, prevMm.y, curMm.x, curMm.y)
-                dMm / 1000.0
-            } ?: displacementPx
-            // Refresh the stored ground point for the next frame's displacement.
-            track.lastGroundPoint = groundPoint(obj)
-            val instantSpeed = if (timeDelta > 0) displacementM / (timeDelta / 1000.0) else 0.0
-            track.smoothedSpeed = smoothSpeed(track.smoothedSpeed, instantSpeed)
-            track.totalDistance += displacementM
-            track.lastMovementTimeMs = now
+    /** Convert the tracker's pixel displacement into real units and update the pinned speed. */
+    private fun updatePinnedSpeed(displacementPx: Double, trackRect: Rect?, now: Long) {
+        // Reject implausible tracker jumps; still advance the clock so a single
+        // bad frame doesn't turn into a huge dt on the next good frame.
+        if (displacementPx <= 0.0 || displacementPx > MAX_DISPLACEMENT_PX) {
+            lastPinnedTimeMs = now
+            return
         }
+        if (lastPinnedTimeMs <= 0L) {
+            lastPinnedTimeMs = now
+            return
+        }
+        val timeDelta = now - lastPinnedTimeMs
+        if (timeDelta <= 0) return
+
+        val displacementM = when {
+            sizeCalibration != null -> {
+                val cal = sizeCalibration!!
+                val curGround = trackRect?.let { rectBottomCenter(it) }
+                val prevGround = lastPinnedGroundPointPx
+                val d = if (curGround != null && prevGround != null) {
+                    val prevMm = PerspectiveCalibration.transformPoint(cal, prevGround)
+                    val curMm = PerspectiveCalibration.transformPoint(cal, curGround)
+                    distance(prevMm.x, prevMm.y, curMm.x, curMm.y) / 1000.0
+                } else null
+                if (curGround != null) lastPinnedGroundPointPx = curGround
+                d ?: speedPixelsPerMeter?.let { displacementPx / it } ?: displacementPx
+            }
+            speedPixelsPerMeter != null -> displacementPx / speedPixelsPerMeter!!
+            else -> displacementPx
+        }
+
+        val instantSpeed = displacementM / (timeDelta / 1000.0)
+        pinnedSpeed = smoothSpeed(pinnedSpeed, instantSpeed)
+        pinnedDistance += displacementM
+        lastPinnedTimeMs = now
     }
 
-    /**
-     * Bottom-centre of an object's rotated bounding box — its approximate
-     * ground-contact point (e.g. a person's feet). This is the point that rests
-     * on the reference plane, so it is the correct point to run through the
-     * plane homography for metric displacement. Image y grows downward, so the
-     * bottom edge is the one with the two largest-y corners.
-     */
-    private fun groundPoint(obj: ImageProcessor.DetectedObject): Point {
-        val corners = PerspectiveCalibration.cornersOf(obj.contour).toArray()
-        val bottom = corners.sortedByDescending { it.y }
-        val p1 = bottom[0]
-        val p2 = bottom[1]
-        return Point((p1.x + p2.x) / 2.0, (p1.y + p2.y) / 2.0)
-    }
+    /** Bottom-centre of a tracker box — the approximate ground-contact point. */
+    private fun rectBottomCenter(r: Rect): Point =
+        Point(r.x + r.width / 2.0, (r.y + r.height).toDouble())
 
-    /**
-     * Fold all live tracks into the aggregate speed stats shown in the top
-     * overlay: current speed is the fastest active object, distance is summed.
-     */
+    /** Fold the pinned target's stats into the top overlay readout. */
     private fun updateAggregateSpeedState(now: Long) {
-        if (trackedObjects.isEmpty()) {
+        if (pinnedContourIndex < 0) {
             if (_uiState.value.isTracking) {
                 _uiState.update { it.copy(isTracking = false, currentSpeed = 0.0) }
             }
             return
         }
 
-        val fastest = trackedObjects.values.maxOf { it.smoothedSpeed }
-        val totalDistance = trackedObjects.values.sumOf { it.totalDistance }
-        val elapsed = if (trackingStartTimeMs > 0L) (now - trackingStartTimeMs) / 1000.0 else 0.0
+        if (trackingStartTimeMs == 0L) trackingStartTimeMs = now
+        val elapsed = (now - trackingStartTimeMs) / 1000.0
 
         _uiState.update {
             it.copy(
                 isTracking = true,
-                currentSpeed = fastest,
-                maxSpeed = maxOf(it.maxSpeed, fastest),
-                totalDistance = totalDistance,
+                currentSpeed = pinnedSpeed,
+                maxSpeed = maxOf(it.maxSpeed, pinnedSpeed),
+                totalDistance = pinnedDistance,
                 elapsedSeconds = elapsed
             )
         }
     }
 
     fun stopTracking() {
-        trackedObjects.clear()
-        trackingStartTimeMs = 0L
-        pinnedTrackId = -1
-        _uiState.update { it.copy(isTracking = false, currentSpeed = 0.0, selectedObjectIndex = -1) }
+        clearSpeedPin()
     }
 
     // ---------------------------------------------------------------- PEOPLE mode
@@ -936,8 +882,17 @@ class MeasureViewModel @Inject constructor(
      */
     private fun handlePeopleFrame(result: ImageProcessor.ProcessingResult) {
         val count = result.detectedFaces.size
-        if (_uiState.value.peopleCount != count) {
-            _uiState.update { it.copy(peopleCount = count) }
+
+        // Median over a short window: resists single-frame false positives and
+        // missed detections so the live count doesn't flicker between frames.
+        peopleCountHistory.add(count)
+        if (peopleCountHistory.size > PEOPLE_COUNT_WINDOW) {
+            peopleCountHistory.removeAt(0)
+        }
+        val stable = peopleCountHistory.sorted().let { it[it.size / 2] }
+
+        if (_uiState.value.peopleCount != stable) {
+            _uiState.update { it.copy(peopleCount = stable) }
         }
     }
 
@@ -1099,9 +1054,11 @@ class MeasureViewModel @Inject constructor(
         private const val MOVING_THRESHOLD_PX = 8.0
         private const val MAX_DISPLACEMENT_PX = 200.0
         private const val ZOOM_STEP = 0.5f
-        private const val SPEED_RESET_TIMEOUT_MS = 800L
         /** Motion is ignored for this long after the camera starts, to let the user steady the phone. */
         private const val SETTLE_DELAY_MS = 1500L
+
+        /** Number of recent frames used to stabilise the PEOPLE face count. */
+        private const val PEOPLE_COUNT_WINDOW = 5
 
         private fun distance(x1: Double, y1: Double, x2: Double, y2: Double): Double {
             val dx = x2 - x1

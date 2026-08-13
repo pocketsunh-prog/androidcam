@@ -31,6 +31,15 @@ object FaceDetector {
     /** Smallest face side (px) to detect, as a fraction of the frame min side. */
     private const val MIN_FACE_FRACTION = 0.05
 
+    /**
+     * Cascade pyramid scale factor. A finer pyramid (lower value) catches
+     * smaller / more distant faces at the cost of more classifier evaluations.
+     */
+    private const val SCALE_FACTOR = 1.05
+
+    /** IoU threshold above which two detections are considered the same face. */
+    private const val NMS_IOU_THRESHOLD = 0.3
+
     @Volatile
     private var classifier: CascadeClassifier? = null
 
@@ -87,20 +96,34 @@ object FaceDetector {
             val targetSmallSide = 480.0
             val scale = if (minSide > targetSmallSide) targetSmallSide / minSide else 1.0
 
-            val detectionMat = if (scale < 1.0) {
+            val detectionMat: Mat
+            val detectionMinSide: Int
+            if (scale < 1.0) {
                 val small = Mat()
                 ImgprocResize(gray, small, scale)
-                val faces = detectAtScale(cc, small, (minSide * MIN_FACE_FRACTION).coerceAtLeast(20.0))
-                small.release()
-                faces
+                detectionMat = small
+                detectionMinSide = minOf(small.width(), small.height())
             } else {
-                detectAtScale(cc, gray, (minSide * MIN_FACE_FRACTION).coerceAtLeast(20.0))
+                detectionMat = gray
+                detectionMinSide = minSide
             }
+
+            // minSize must be relative to the image actually passed to the
+            // classifier. Computing it from the original frame while classifying
+            // a downscaled image made the minimum face too large and missed
+            // distant/small faces.
+            val minFaceSide = (detectionMinSide * MIN_FACE_FRACTION).coerceAtLeast(20.0)
+            val rawFaces = detectAtScale(cc, detectionMat, minFaceSide)
+            if (scale < 1.0) detectionMat.release()
+
+            // Haar often fires several overlapping boxes on one face; merge them
+            // so the count reflects distinct faces, not duplicate detections.
+            val faces = nonMaxSuppression(rawFaces)
 
             if (scale < 1.0) {
                 // Map rectangles back to the original frame coordinates.
                 val inv = 1.0 / scale
-                detectionMat.map { r ->
+                faces.map { r ->
                     Rect(
                         (r.x * inv).toInt(),
                         (r.y * inv).toInt(),
@@ -109,7 +132,7 @@ object FaceDetector {
                     )
                 }
             } else {
-                detectionMat
+                faces
             }
         } catch (e: Exception) {
             Log.e(TAG, "Face detection failed", e)
@@ -122,7 +145,7 @@ object FaceDetector {
         cc.detectMultiScale(
             gray,
             faces,
-            /* scaleFactor = */ 1.1,
+            /* scaleFactor = */ SCALE_FACTOR,
             /* minNeighbors = */ 4,
             /* flags = */ 0,
             /* minSize = */ Size(minSide, minSide),
@@ -131,6 +154,33 @@ object FaceDetector {
         val result = faces.toList()
         faces.release()
         return result
+    }
+
+    /** Greedy IoU-based non-maximum suppression, largest boxes first. */
+    private fun nonMaxSuppression(rects: List<Rect>): List<Rect> {
+        if (rects.size <= 1) return rects
+
+        val sorted = rects.sortedByDescending { it.width.toLong() * it.height }
+        val kept = mutableListOf<Rect>()
+        for (r in sorted) {
+            val overlaps = kept.any { intersectionOverUnion(r, it) > NMS_IOU_THRESHOLD }
+            if (!overlaps) kept.add(r)
+        }
+        return kept
+    }
+
+    private fun intersectionOverUnion(a: Rect, b: Rect): Double {
+        val x1 = maxOf(a.x, b.x)
+        val y1 = maxOf(a.y, b.y)
+        val x2 = minOf(a.x + a.width, b.x + b.width)
+        val y2 = minOf(a.y + a.height, b.y + b.height)
+        val interW = (x2 - x1).coerceAtLeast(0)
+        val interH = (y2 - y1).coerceAtLeast(0)
+        val inter = interW.toLong() * interH
+        val areaA = a.width.toLong() * a.height
+        val areaB = b.width.toLong() * b.height
+        val union = areaA + areaB - inter
+        return if (union <= 0) 0.0 else inter.toDouble() / union
     }
 
     private fun ImgprocResize(src: Mat, dst: Mat, scale: Double) {

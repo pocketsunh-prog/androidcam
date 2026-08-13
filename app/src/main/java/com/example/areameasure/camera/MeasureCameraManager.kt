@@ -15,6 +15,7 @@ import androidx.lifecycle.LifecycleOwner
 import com.example.areameasure.domain.MeasureMode
 import com.example.areameasure.processing.ImageProcessor
 import dagger.hilt.android.qualifiers.ApplicationContext
+import org.opencv.core.Rect
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -75,6 +76,16 @@ class MeasureCameraManager @Inject constructor(
         analyzer.setTargetContourIndex(index)
     }
 
+    /** Restrict overlay contour marking to these indices (SPEED: moving objects only). */
+    fun setMarkedContourIndices(indices: Set<Int>?) {
+        analyzer.setMarkedContourIndices(indices)
+    }
+
+    /** Seed (or clear) the SPEED visual tracker from a raw-frame bounding box. */
+    fun setSpeedTargetRect(rect: Rect?) {
+        imageProcessor.setSpeedTargetRect(rect)
+    }
+
     fun getCamera(): Camera? = camera
 
     suspend fun startCamera(
@@ -98,6 +109,15 @@ class MeasureCameraManager @Inject constructor(
             // Scan for faces only in PEOPLE mode. The detector is initialized
             // once at app startup; this just toggles per-frame detection.
             imageProcessor.detectFaces = measureMode == MeasureMode.PEOPLE
+
+            // Visual target tracking (for accurate speed) runs only in SPEED mode.
+            imageProcessor.speedTrackingEnabled = measureMode == MeasureMode.SPEED
+
+            // SPEED starts with nothing marked until the ViewModel reports a
+            // moving/tracked contour; other modes mark every contour.
+            analyzer.setMarkedContourIndices(
+                if (measureMode == MeasureMode.SPEED) emptySet() else null
+            )
 
             // Align the preview to the display rotation so it isn't shown
             // sideways in a portrait UI (the camera sensor is landscape).

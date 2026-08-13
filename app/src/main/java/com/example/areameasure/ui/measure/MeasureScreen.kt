@@ -296,7 +296,7 @@ private fun StartStopButton(
 private fun ModeControls(uiState: MeasureUiState, viewModel: MeasureViewModel) {
     when (uiState.mode) {
         MeasureMode.SIZE -> SizeControls(uiState = uiState, viewModel = viewModel)
-        MeasureMode.SPEED -> SpeedControls(uiState = uiState)
+        MeasureMode.SPEED -> SpeedControls(uiState = uiState, viewModel = viewModel)
         MeasureMode.PEOPLE -> PeopleControls(uiState = uiState, viewModel = viewModel)
     }
 }
@@ -450,6 +450,17 @@ fun MeasureScreen(
             pixelHeight = uiState.selectedPixelY,
             onDismiss = { viewModel.dismissCalibrationDialog() },
             onCalibrate = { w, h -> viewModel.setSizeCalibration(w, h) }
+        )
+    }
+
+    // Calibration dialog (SPEED) — a known real-world length of the pinned
+    // object, used to derive a pixels-per-metre scale for m/s speed.
+    if (uiState.mode == MeasureMode.SPEED && uiState.showSpeedCalibrationDialog) {
+        CalibrationDialog(
+            pixelWidth = uiState.selectedPixelX,
+            pixelHeight = null,
+            onDismiss = { viewModel.dismissSpeedCalibrationDialog() },
+            onCalibrate = { w, _ -> viewModel.setSpeedCalibration(w) }
         )
     }
 
@@ -640,26 +651,25 @@ private fun SizeControls(uiState: MeasureUiState, viewModel: MeasureViewModel) {
 // ---------------------------------------------------------------- SPEED controls
 
 @Composable
-private fun SpeedControls(uiState: MeasureUiState) {
+private fun SpeedControls(uiState: MeasureUiState, viewModel: MeasureViewModel) {
     Spacer(modifier = Modifier.height(8.dp))
 
     if (uiState.isCameraRunning && !uiState.isTracking) {
+        val movingCount = uiState.detectedObjects.count { it.isMoving }
         Text(
-            text = "Tap a moving object to check its speed",
+            text = if (movingCount > 0) {
+                "$movingCount moving ${if (movingCount == 1) "object" else "objects"} marked — tap one to measure its speed"
+            } else {
+                "Point at a moving object, then tap it to measure its speed"
+            },
             style = MaterialTheme.typography.bodyMedium,
             color = Color(0xFFAAAAAA)
         )
     } else if (uiState.isTracking) {
-        val movingCount = uiState.detectedObjects.count { it.isMoving }
-        val pinned = uiState.selectedObjectIndex >= 0
         Text(
-            text = when {
-                pinned -> "Pinned — measuring selected object. Tap again to release."
-                movingCount > 1 -> "Tracking $movingCount moving objects..."
-                else -> "Tracking moving object..."
-            },
+            text = "Pinned — tracking selected object. Tap it again (or empty space) to release.",
             style = MaterialTheme.typography.bodyMedium,
-            color = if (pinned) Color(0xFFFFD54F) else Color(0xFF69F0AE)
+            color = Color(0xFFFFD54F)
         )
     } else if (!uiState.isCameraRunning) {
         Text(
@@ -667,6 +677,20 @@ private fun SpeedControls(uiState: MeasureUiState) {
             style = MaterialTheme.typography.bodyMedium,
             color = Color(0xFFAAAAAA)
         )
+    }
+
+    // A real-world scale is required to report m/s; offer it once the user has
+    // pinned a moving object and no metric scale is available yet.
+    if (uiState.isCameraRunning && uiState.isTracking &&
+        !uiState.speedUsesMetric && uiState.selectedObjectIndex >= 0
+    ) {
+        Spacer(modifier = Modifier.height(10.dp))
+        Button(
+            onClick = { viewModel.showSpeedCalibrationDialog() },
+            colors = ButtonDefaults.buttonColors(containerColor = Color(0xFFFF9800))
+        ) {
+            Text("Calibrate (m/s)")
+        }
     }
 }
 
@@ -956,7 +980,9 @@ private fun SpeedObjectLabels(
     val unit = if (calibrated) "m/s" else "px/s"
     Box(modifier = Modifier.fillMaxSize()) {
         objects.forEach { obj ->
-            if (obj.isMoving && obj.speed > 0.0) {
+            // Show the speed readout on the pinned target even while it is
+            // momentarily still; auto-marked objects only show it while moving.
+            if ((obj.isMoving || obj.isTracked) && obj.speed > 0.0) {
                 val center = viewModel.frameToViewCenter(
                     frameX = obj.centerX,
                     frameY = obj.centerY,

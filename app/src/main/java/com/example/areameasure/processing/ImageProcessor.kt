@@ -8,8 +8,10 @@ import org.opencv.core.Rect
 import org.opencv.core.Scalar
 import org.opencv.core.Size
 import org.opencv.imgproc.Imgproc
+import org.opencv.video.TrackerMIL
 import kotlin.math.cos
 import kotlin.math.sin
+import kotlin.math.sqrt
 
 /**
  * OpenCV-based image processing pipeline.
@@ -60,7 +62,16 @@ class ImageProcessor {
          */
         val frameTimestampNanos: Long = 0L,
         /** Faces detected in this frame (raw-frame pixel coords). Empty unless [detectFaces]. */
-        val detectedFaces: List<Rect> = emptyList()
+        val detectedFaces: List<Rect> = emptyList(),
+        /**
+         * SPEED mode: frame-to-frame displacement of the tracked target's
+         * bounding-box centre, in raw-frame pixels (0 when not tracking).
+         */
+        val speedDisplacementPx: Double = 0.0,
+        /** SPEED mode: the tracked target's current bounding box (raw-frame coords). */
+        val speedTrackRect: Rect? = null,
+        /** SPEED mode: true while the visual tracker has a lock on the target. */
+        val speedTrackActive: Boolean = false
     ) {
         val selectedObject: DetectedObject?
             get() = detectedObjects.getOrNull(selectedIndex)
@@ -86,15 +97,48 @@ class ImageProcessor {
      */
     var detectFaces: Boolean = false
 
+    /** When true (SPEED mode), the user-selected target is tracked with a visual tracker. */
+    var speedTrackingEnabled: Boolean = false
+
+    @Volatile
+    private var speedTracker: TrackerMIL? = null
+
+    @Volatile
+    private var speedTrackRect: Rect? = null
+
+    @Volatile
+    private var speedPrevCenter: Point? = null
+
+    /** Seed box set by the UI thread; consumed by the next frame. */
+    @Volatile
+    private var pendingSpeedSeed: Rect? = null
+
+    /**
+     * (Re)initialise the SPEED tracker from a bounding box (raw-frame coords),
+     * or pass null to stop tracking and release the tracker.
+     */
+    fun setSpeedTargetRect(rect: Rect?) {
+        pendingSpeedSeed = rect
+        if (rect == null) {
+            speedTracker = null
+            speedTrackRect = null
+            speedPrevCenter = null
+        }
+    }
+
     /**
      * Process a camera frame.
      *
      * @param inputMat           The camera frame as RGBA Mat.
      * @param selectedTargetIndex User-selected target contour index, or -1 for auto (largest).
+     * @param markContourIndices When non-null, only these contour indices are drawn as
+     *        overlays (used by SPEED mode so only moving/tracked objects are marked).
+     *        When null, every detected contour is drawn.
      */
     fun processFrame(
         inputMat: Mat,
-        selectedTargetIndex: Int = -1
+        selectedTargetIndex: Int = -1,
+        markContourIndices: Set<Int>? = null
     ): ProcessingResult {
         val frameWidth = inputMat.width()
         val frameHeight = inputMat.height()
@@ -179,6 +223,10 @@ class ImageProcessor {
         val annotated = inputMat.clone()
 
         detectedObjects.forEach { obj ->
+            // SPEED mode supplies an explicit mark set so only moving/tracked
+            // objects are outlined; other modes mark every detected contour.
+            val marked = markContourIndices?.contains(obj.contourIndex) ?: true
+            if (!marked) return@forEach
             // Draw contours: selected = red, others = cyan
             val color = if (obj.contourIndex == selectedIdx) Scalar(255.0, 0.0, 0.0)
                        else Scalar(255.0, 255.0, 0.0)
@@ -212,6 +260,55 @@ class ImageProcessor {
             emptyList()
         }
 
+        // 12. SPEED: track the user-selected target with a MIL visual tracker and
+        // measure its frame-to-frame displacement. A tracker bounding-box centre
+        // is far more stable than raw contour centroids, so speed reads smoother.
+        var speedDisplacementPx = 0.0
+        var trackRectOut: Rect? = null
+        var speedTrackActive = false
+        if (speedTrackingEnabled) {
+            val seed = pendingSpeedSeed
+            if (seed != null) {
+                pendingSpeedSeed = null
+                speedTracker = TrackerMIL.create()
+                speedTracker?.init(gray, seed)
+                speedTrackRect = seed
+                speedPrevCenter = centerOf(seed)
+                trackRectOut = seed
+                speedTrackActive = true
+            } else {
+                val tracker = speedTracker
+                val rect = speedTrackRect
+                if (tracker != null && rect != null) {
+                    val updated = Rect(rect.x, rect.y, rect.width, rect.height)
+                    if (tracker.update(gray, updated)) {
+                        val c = centerOf(updated)
+                        val prev = speedPrevCenter
+                        if (prev != null) {
+                            val dx = c.x - prev.x
+                            val dy = c.y - prev.y
+                            speedDisplacementPx = sqrt(dx * dx + dy * dy)
+                        }
+                        speedPrevCenter = c
+                        speedTrackRect = updated
+                        trackRectOut = updated
+                        speedTrackActive = true
+                    }
+                }
+            }
+
+            // Draw the tracked box in amber so the user sees what is measured.
+            trackRectOut?.let { r ->
+                Imgproc.rectangle(
+                    annotated,
+                    Point(r.x.toDouble(), r.y.toDouble()),
+                    Point((r.x + r.width).toDouble(), (r.y + r.height).toDouble()),
+                    Scalar(255.0, 213.0, 79.0),
+                    3
+                )
+            }
+        }
+
         // Release intermediate mats
         gray.release(); blurred.release(); edges.release(); hierarchy.release(); kernel.release()
 
@@ -221,9 +318,15 @@ class ImageProcessor {
             frameHeight = frameHeight,
             detectedObjects = detectedObjects,
             selectedIndex = selectedIdx,
-            detectedFaces = faces
+            detectedFaces = faces,
+            speedDisplacementPx = speedDisplacementPx,
+            speedTrackRect = trackRectOut,
+            speedTrackActive = speedTrackActive
         )
     }
+
+    private fun centerOf(r: Rect): Point =
+        Point(r.x + r.width / 2.0, r.y + r.height / 2.0)
 
     /**
      * Draw 3D orientation axes (X, Y, Z) on a detected object.

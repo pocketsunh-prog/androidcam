@@ -21,8 +21,19 @@ class CameraFrameAnalyzer(
     @Volatile
     private var targetContourIndex: Int = -1
 
+    /**
+     * When non-null, only these contour indices are marked in the overlay
+     * (SPEED mode: the set of moving/tracked objects). Null = mark all contours.
+     */
+    @Volatile
+    private var markedContourIndices: Set<Int>? = null
+
     fun setTargetContourIndex(index: Int) {
         targetContourIndex = index
+    }
+
+    fun setMarkedContourIndices(indices: Set<Int>?) {
+        markedContourIndices = indices
     }
 
     override fun analyze(image: ImageProxy) {
@@ -30,7 +41,8 @@ class CameraFrameAnalyzer(
             val mat = image.toRgbaMat()
             val result = imageProcessor.processFrame(
                 inputMat = mat,
-                selectedTargetIndex = targetContourIndex
+                selectedTargetIndex = targetContourIndex,
+                markContourIndices = markedContourIndices
             )
             // Stamp the hardware capture timestamp so the ViewModel can compute
             // frame-to-frame dt from the sensor clock instead of the wall clock.
