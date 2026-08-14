@@ -134,7 +134,18 @@ data class MeasureUiState(
     /** True while a running clip is being recorded. */
     val isRecording: Boolean = false,
     /** Non-null shows a "saved" confirmation dialog. */
-    val runningSavedMessage: String? = null
+    val runningSavedMessage: String? = null,
+    // --- FAN mode ---
+    /** Number of blades on the fan (affects RPM conversion). */
+    val bladeCount: Int = 3,
+    /** Estimated blade-pass frequency in Hz (null until a period is detected). */
+    val fanPassFrequencyHz: Double? = null,
+    /** Estimated rotation speed in RPM (null until a period is detected). */
+    val fanRpm: Double? = null,
+    /** Normalised motion energy of the detected region (0..1). */
+    val fanEnergy: Double = 0.0,
+    /** Number of samples accumulated by the fan analyzer. */
+    val fanSampleCount: Int = 0
 )
 
 @HiltViewModel
@@ -151,6 +162,7 @@ class MeasureViewModel @Inject constructor(
 
     private var processingCollectionJob: Job? = null
     private var poseCollectionJob: Job? = null
+    private var fanCollectionJob: Job? = null
 
     // --- SIZE calibration state ---
 
@@ -263,7 +275,11 @@ class MeasureViewModel @Inject constructor(
                 postureCorrect = null,
                 trunkLeanDegrees = null,
                 isRecording = false,
-                runningSavedMessage = null
+                runningSavedMessage = null,
+                fanPassFrequencyHz = null,
+                fanRpm = null,
+                fanEnergy = 0.0,
+                fanSampleCount = 0
             )
         }
     }
@@ -300,6 +316,8 @@ class MeasureViewModel @Inject constructor(
         processingCollectionJob = null
         poseCollectionJob?.cancel()
         poseCollectionJob = null
+        fanCollectionJob?.cancel()
+        fanCollectionJob = null
         prevObjects = emptyList()
         movingContourIndices = emptySet()
         cameraStartedAtMs = 0L
@@ -318,7 +336,11 @@ class MeasureViewModel @Inject constructor(
                 peopleCount = 0,
                 postureCorrect = null,
                 trunkLeanDegrees = null,
-                isRecording = false
+                isRecording = false,
+                fanPassFrequencyHz = null,
+                fanRpm = null,
+                fanEnergy = 0.0,
+                fanSampleCount = 0
             )
         }
     }
@@ -356,7 +378,11 @@ class MeasureViewModel @Inject constructor(
                 postureCorrect = null,
                 trunkLeanDegrees = null,
                 isRecording = false,
-                runningSavedMessage = null
+                runningSavedMessage = null,
+                fanPassFrequencyHz = null,
+                fanRpm = null,
+                fanEnergy = 0.0,
+                fanSampleCount = 0
             )
         }
     }
@@ -425,6 +451,7 @@ class MeasureViewModel @Inject constructor(
                     MeasureMode.PEOPLE -> handlePeopleFrame(result)
                     MeasureMode.SIZE -> { /* dimensions computed below */ }
                     MeasureMode.RUNNING -> { /* pose handled by the pose collector */ }
+                    MeasureMode.FAN -> { /* fan speed handled by the fan collector */ }
                 }
 
                 // Map each detected contour to its live status so the overlay can
@@ -503,6 +530,25 @@ class MeasureViewModel @Inject constructor(
                     it.copy(
                         postureCorrect = if (result.hasPose) result.isCorrect else null,
                         trunkLeanDegrees = result.trunkLeanDegrees
+                    )
+                }
+            }
+        }
+
+        // FAN mode blade-speed stream.
+        fanCollectionJob?.cancel()
+        fanCollectionJob = viewModelScope.launch {
+            cameraManager.fanResults.collect { result ->
+                if (_uiState.value.mode != MeasureMode.FAN) return@collect
+                if (result == null) return@collect
+                val blades = _uiState.value.bladeCount
+                val rpm = result.passFrequencyHz?.let { it * 60.0 / blades }
+                _uiState.update {
+                    it.copy(
+                        fanPassFrequencyHz = result.passFrequencyHz,
+                        fanRpm = rpm,
+                        fanEnergy = result.energy,
+                        fanSampleCount = result.sampleCount
                     )
                 }
             }
@@ -1070,6 +1116,20 @@ class MeasureViewModel @Inject constructor(
         _uiState.update { it.copy(runningSavedMessage = null) }
     }
 
+    // ---------------------------------------------------------------- FAN mode
+
+    /** Set the fan blade count; RPM is recomputed on the next analyzer result. */
+    fun selectBladeCount(count: Int) {
+        if (count !in 2..6) return
+        val passHz = _uiState.value.fanPassFrequencyHz
+        _uiState.update {
+            it.copy(
+                bladeCount = count,
+                fanRpm = passHz?.let { hz -> hz * 60.0 / count }
+            )
+        }
+    }
+
     fun zoomIn() {
         val current = _uiState.value.zoomRatio
         val max = _uiState.value.maxZoomRatio
@@ -1163,6 +1223,7 @@ class MeasureViewModel @Inject constructor(
         cameraManager.shutdown()
         processingCollectionJob?.cancel()
         poseCollectionJob?.cancel()
+        fanCollectionJob?.cancel()
     }
 
     private fun matToBitmap(mat: org.opencv.core.Mat): Bitmap? {

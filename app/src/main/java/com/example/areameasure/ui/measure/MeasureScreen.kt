@@ -31,6 +31,7 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.automirrored.filled.DirectionsRun
 import androidx.compose.material.icons.filled.Add
+import androidx.compose.material.icons.filled.Air
 import androidx.compose.material.icons.filled.CameraAlt
 import androidx.compose.material.icons.filled.DeleteSweep
 import androidx.compose.material.icons.filled.History
@@ -163,6 +164,8 @@ private fun CameraPreviewArea(
                                     MeasureMode.PEOPLE -> Unit
                                     // RUNNING has no tap-to-select interaction.
                                     MeasureMode.RUNNING -> Unit
+                                    // FAN is fully automatic.
+                                    MeasureMode.FAN -> Unit
                                 }
                             }
                         }
@@ -221,6 +224,16 @@ private fun CameraPreviewArea(
             RunningPostureOverlay(
                 postureCorrect = uiState.postureCorrect,
                 trunkLeanDegrees = uiState.trunkLeanDegrees,
+                modifier = Modifier.align(Alignment.TopCenter)
+            )
+        }
+
+        // FAN: live RPM overlay.
+        if (uiState.mode == MeasureMode.FAN && uiState.isCameraRunning) {
+            FanOverlay(
+                rpm = uiState.fanRpm,
+                passFrequencyHz = uiState.fanPassFrequencyHz,
+                bladeCount = uiState.bladeCount,
                 modifier = Modifier.align(Alignment.TopCenter)
             )
         }
@@ -315,6 +328,7 @@ private fun ModeControls(uiState: MeasureUiState, viewModel: MeasureViewModel) {
         MeasureMode.SPEED -> SpeedControls(uiState = uiState, viewModel = viewModel)
         MeasureMode.PEOPLE -> PeopleControls(uiState = uiState, viewModel = viewModel)
         MeasureMode.RUNNING -> RunningControls(uiState = uiState, viewModel = viewModel)
+        MeasureMode.FAN -> FanControls(uiState = uiState, viewModel = viewModel)
     }
 }
 
@@ -540,41 +554,58 @@ private fun MeasureModeToggle(
     onSelect: (MeasureMode) -> Unit,
     modifier: Modifier = Modifier
 ) {
-    Row(
-        modifier = modifier,
-        horizontalArrangement = Arrangement.Center
-    ) {
-        ModeButton(
-            label = "Size",
-            icon = Icons.Default.SquareFoot,
-            selected = selected == MeasureMode.SIZE,
-            onClick = { onSelect(MeasureMode.SIZE) },
-            modifier = Modifier.weight(1f)
-        )
-        Spacer(modifier = Modifier.width(4.dp))
-        ModeButton(
-            label = "Speed",
-            icon = Icons.Default.Speed,
-            selected = selected == MeasureMode.SPEED,
-            onClick = { onSelect(MeasureMode.SPEED) },
-            modifier = Modifier.weight(1f)
-        )
-        Spacer(modifier = Modifier.width(4.dp))
-        ModeButton(
-            label = "People",
-            icon = Icons.Default.Person,
-            selected = selected == MeasureMode.PEOPLE,
-            onClick = { onSelect(MeasureMode.PEOPLE) },
-            modifier = Modifier.weight(1f)
-        )
-        Spacer(modifier = Modifier.width(4.dp))
-        ModeButton(
-            label = "Run",
-            icon = Icons.AutoMirrored.Filled.DirectionsRun,
-            selected = selected == MeasureMode.RUNNING,
-            onClick = { onSelect(MeasureMode.RUNNING) },
-            modifier = Modifier.weight(1f)
-        )
+    Column(modifier = modifier) {
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.Center
+        ) {
+            ModeButton(
+                label = "Size",
+                icon = Icons.Default.SquareFoot,
+                selected = selected == MeasureMode.SIZE,
+                onClick = { onSelect(MeasureMode.SIZE) },
+                modifier = Modifier.weight(1f)
+            )
+            Spacer(modifier = Modifier.width(4.dp))
+            ModeButton(
+                label = "Speed",
+                icon = Icons.Default.Speed,
+                selected = selected == MeasureMode.SPEED,
+                onClick = { onSelect(MeasureMode.SPEED) },
+                modifier = Modifier.weight(1f)
+            )
+            Spacer(modifier = Modifier.width(4.dp))
+            ModeButton(
+                label = "People",
+                icon = Icons.Default.Person,
+                selected = selected == MeasureMode.PEOPLE,
+                onClick = { onSelect(MeasureMode.PEOPLE) },
+                modifier = Modifier.weight(1f)
+            )
+        }
+        Spacer(modifier = Modifier.height(4.dp))
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.Center
+        ) {
+            ModeButton(
+                label = "Run",
+                icon = Icons.AutoMirrored.Filled.DirectionsRun,
+                selected = selected == MeasureMode.RUNNING,
+                onClick = { onSelect(MeasureMode.RUNNING) },
+                modifier = Modifier.weight(1f)
+            )
+            Spacer(modifier = Modifier.width(4.dp))
+            ModeButton(
+                label = "Fan",
+                icon = Icons.Default.Air,
+                selected = selected == MeasureMode.FAN,
+                onClick = { onSelect(MeasureMode.FAN) },
+                modifier = Modifier.weight(1f)
+            )
+            Spacer(modifier = Modifier.width(4.dp))
+            Spacer(modifier = Modifier.weight(1f))
+        }
     }
 }
 
@@ -926,6 +957,113 @@ private fun RunningPostureOverlay(
                 text = "Lean ${"%.0f".format(trunkLeanDegrees)}°",
                 style = MaterialTheme.typography.bodySmall,
                 color = Color.White
+            )
+        }
+    }
+}
+
+// ---------------------------------------------------------------- FAN controls
+
+@Composable
+private fun FanControls(uiState: MeasureUiState, viewModel: MeasureViewModel) {
+    Text(
+        text = "Blades",
+        style = MaterialTheme.typography.bodyMedium,
+        color = Color(0xFFAAAAAA)
+    )
+    Spacer(modifier = Modifier.height(6.dp))
+    Row(
+        modifier = Modifier.fillMaxWidth(),
+        horizontalArrangement = Arrangement.Center
+    ) {
+        (2..6).forEach { n ->
+            BladeButton(
+                count = n,
+                selected = uiState.bladeCount == n,
+                onClick = { viewModel.selectBladeCount(n) },
+                modifier = Modifier.weight(1f)
+            )
+            if (n < 6) Spacer(modifier = Modifier.width(4.dp))
+        }
+    }
+
+    Spacer(modifier = Modifier.height(10.dp))
+
+    Text(
+        text = if (uiState.fanRpm != null) {
+            "Locked — keep the camera still"
+        } else if (uiState.isCameraRunning) {
+            "Detecting… aim at the spinning fan and hold still"
+        } else {
+            "Press Start to begin"
+        },
+        style = MaterialTheme.typography.bodyMedium,
+        color = if (uiState.fanRpm != null) Color(0xFF69F0AE) else Color(0xFFAAAAAA)
+    )
+}
+
+@Composable
+private fun BladeButton(
+    count: Int,
+    selected: Boolean,
+    onClick: () -> Unit,
+    modifier: Modifier = Modifier
+) {
+    Button(
+        onClick = onClick,
+        modifier = modifier.height(40.dp),
+        colors = if (selected) ButtonDefaults.buttonColors()
+                 else ButtonDefaults.outlinedButtonColors(),
+        border = if (selected) null else ButtonDefaults.outlinedButtonBorder
+    ) {
+        Text("$count")
+    }
+}
+
+@Composable
+private fun FanOverlay(
+    rpm: Double?,
+    passFrequencyHz: Double?,
+    bladeCount: Int,
+    modifier: Modifier = Modifier
+) {
+    Column(
+        modifier = modifier
+            .fillMaxWidth()
+            .padding(12.dp)
+            .background(Color.Black.copy(alpha = 0.7f), RoundedCornerShape(12.dp))
+            .padding(12.dp),
+        horizontalAlignment = Alignment.CenterHorizontally
+    ) {
+        Icon(
+            Icons.Default.Air,
+            contentDescription = null,
+            tint = Color(0xFF69F0AE),
+            modifier = Modifier.size(28.dp)
+        )
+        if (rpm != null) {
+            Text(
+                text = "${"%.0f".format(rpm)} RPM",
+                style = MaterialTheme.typography.headlineMedium,
+                fontWeight = FontWeight.Bold,
+                color = Color.White
+            )
+            Text(
+                text = "${"%.1f".format(passFrequencyHz)} Hz · $bladeCount blades",
+                style = MaterialTheme.typography.bodySmall,
+                color = Color(0xFF888888)
+            )
+        } else {
+            Text(
+                text = "Detecting…",
+                style = MaterialTheme.typography.headlineMedium,
+                fontWeight = FontWeight.Bold,
+                color = Color.White
+            )
+            Text(
+                text = "aim at the spinning fan and hold still",
+                style = MaterialTheme.typography.bodySmall,
+                color = Color(0xFF888888)
             )
         }
     }

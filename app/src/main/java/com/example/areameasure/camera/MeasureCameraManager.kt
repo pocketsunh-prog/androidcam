@@ -64,11 +64,18 @@ class MeasureCameraManager @Inject constructor(
         _runningPoseResults.value = result
     }
 
+    private val fanAnalyzer = FanSpeedAnalyzer { result ->
+        _fanResults.value = result
+    }
+
     private val _processingResults = MutableStateFlow<ImageProcessor.ProcessingResult?>(null)
     val processingResults: StateFlow<ImageProcessor.ProcessingResult?> = _processingResults.asStateFlow()
 
     private val _runningPoseResults = MutableStateFlow<PoseDetector.Result?>(null)
     val runningPoseResults: StateFlow<PoseDetector.Result?> = _runningPoseResults.asStateFlow()
+
+    private val _fanResults = MutableStateFlow<FanSpeedAnalyzer.FanSpeedResult?>(null)
+    val fanResults: StateFlow<FanSpeedAnalyzer.FanSpeedResult?> = _fanResults.asStateFlow()
 
     private var analysisExecutor = Executors.newSingleThreadExecutor()
 
@@ -111,6 +118,7 @@ class MeasureCameraManager @Inject constructor(
             }
 
             val isRunning = measureMode == MeasureMode.RUNNING
+            val isFan = measureMode == MeasureMode.FAN
 
             // OpenCV processing flags.
             imageProcessor.drawAxes = measureMode == MeasureMode.SIZE
@@ -138,6 +146,9 @@ class MeasureCameraManager @Inject constructor(
 
             if (isRunning) {
                 imageAnalysis!!.setAnalyzer(analysisExecutor, poseAnalyzer)
+            } else if (isFan) {
+                fanAnalyzer.reset()
+                imageAnalysis!!.setAnalyzer(analysisExecutor, fanAnalyzer)
             } else {
                 imageAnalysis!!.setAnalyzer(analysisExecutor, analyzer)
             }
