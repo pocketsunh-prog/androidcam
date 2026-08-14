@@ -189,23 +189,26 @@ class MeasureViewModel @Inject constructor(
     // --- SPEED tracking state ---
 
     /**
-     * Contour index the user pinned to measure speed (-1 = none). Speed is now
-     * measured for this single target only, using a visual tracker (see
-     * ImageProcessor.speedTracker) whose bounding-box centre is far more stable
-     * than raw contour centroids.
+     * Contour index currently measured for speed (-1 = none). Auto-picked from
+     * the largest moving object unless the user taps a specific one. Speed uses
+     * a visual tracker (ImageProcessor.speedTracker) whose bounding-box centre
+     * is far more stable than raw contour centroids.
      */
-    private var pinnedContourIndex: Int = -1
+    private var trackedContourIndex: Int = -1
+
+    /** True once the user has manually tapped a target (overrides auto-pick). */
+    private var userPinned: Boolean = false
 
     /** Contour indices currently detected as moving (used only to mark them). */
     private var movingContourIndices: Set<Int> = emptySet()
 
-    /** Smoothed speed of the pinned target (px/s or m/s depending on calibration). */
+    /** Smoothed speed of the tracked target (px/s or m/s depending on calibration). */
     private var pinnedSpeed: Double = 0.0
 
-    /** Accumulated distance of the pinned target in the current unit. */
+    /** Accumulated distance of the tracked target in the current unit. */
     private var pinnedDistance: Double = 0.0
 
-    /** Sensor timestamp of the last frame that contributed to the pinned speed. */
+    /** Sensor timestamp of the last frame that contributed to the tracked speed. */
     private var lastPinnedTimeMs: Long = 0L
 
     /** Previous ground-contact point (pixels) for the plane-homography metric path. */
@@ -425,9 +428,9 @@ class MeasureViewModel @Inject constructor(
                 }
 
                 // Map each detected contour to its live status so the overlay can
-                // mark moving objects and show the pinned target's speed.
+                // mark moving objects and show the tracked target's speed.
                 val selectableObjects = result.detectedObjects.map { obj ->
-                    val isPinned = obj.contourIndex == pinnedContourIndex
+                    val isTracked = obj.contourIndex == trackedContourIndex
                     MeasureDetectedObject(
                         contourIndex = obj.contourIndex,
                         centerX = obj.center.x.toFloat(),
@@ -436,10 +439,10 @@ class MeasureViewModel @Inject constructor(
                         pixelHeight = obj.pixelHeight.toFloat(),
                         pixelDepth = obj.pixelDepth.toFloat(),
                         angle = obj.angle.toFloat(),
-                        isSelected = isPinned,
+                        isSelected = isTracked && userPinned,
                         isMoving = obj.contourIndex in movingContourIndices,
-                        isTracked = isPinned,
-                        speed = if (isPinned) pinnedSpeed else 0.0
+                        isTracked = isTracked,
+                        speed = if (isTracked) pinnedSpeed else 0.0
                     )
                 }
 
@@ -608,8 +611,8 @@ class MeasureViewModel @Inject constructor(
             }
         }
 
-        // Toggle: tapping the currently-pinned object again clears it.
-        if (closestIndex >= 0 && closestIndex == pinnedContourIndex) {
+        // Toggle: tapping the currently-pinned object again clears it (back to auto).
+        if (closestIndex >= 0 && userPinned && closestIndex == trackedContourIndex) {
             clearSpeedPin()
             return
         }
@@ -617,7 +620,7 @@ class MeasureViewModel @Inject constructor(
         if (closestIndex >= 0) {
             pinSpeedTarget(closestIndex)
         } else {
-            // Tapped empty space (or a stationary object) — clear the pin.
+            // Tapped empty space (or a stationary object) — clear and go back to auto.
             clearSpeedPin()
         }
     }
@@ -631,7 +634,8 @@ class MeasureViewModel @Inject constructor(
             ?: return
         val seedRect = Imgproc.boundingRect(targetObj.contour)
 
-        pinnedContourIndex = contourIndex
+        trackedContourIndex = contourIndex
+        userPinned = true
         pinnedSpeed = 0.0
         pinnedDistance = 0.0
         lastPinnedTimeMs = 0L
@@ -652,9 +656,34 @@ class MeasureViewModel @Inject constructor(
         }
     }
 
-    /** Clear the pinned target, its tracker and the live speed readout. */
+    /** Auto-pick [obj] and (re)seed the tracker without marking it user-pinned. */
+    private fun seedTracker(obj: ImageProcessor.DetectedObject) {
+        val seedRect = Imgproc.boundingRect(obj.contour)
+
+        trackedContourIndex = obj.contourIndex
+        pinnedSpeed = 0.0
+        pinnedDistance = 0.0
+        lastPinnedTimeMs = 0L
+        lastPinnedGroundPointPx = null
+        trackingStartTimeMs = 0L
+
+        cameraManager.setTargetContourIndex(obj.contourIndex)
+        cameraManager.setSpeedTargetRect(seedRect)
+        _uiState.update {
+            it.copy(
+                isTracking = true,
+                currentSpeed = 0.0,
+                maxSpeed = 0.0,
+                totalDistance = 0.0,
+                elapsedSeconds = 0.0
+            )
+        }
+    }
+
+    /** Clear the target (and manual pin), its tracker and the live readout. */
     private fun clearSpeedPin() {
-        pinnedContourIndex = -1
+        trackedContourIndex = -1
+        userPinned = false
         pinnedSpeed = 0.0
         pinnedDistance = 0.0
         lastPinnedTimeMs = 0L
@@ -716,9 +745,10 @@ class MeasureViewModel @Inject constructor(
      */
     fun setSpeedCalibration(referenceLengthMm: Double) {
         if (referenceLengthMm <= 0.0) return
-        if (pinnedContourIndex < 0) return
-        val obj = prevObjects.firstOrNull { it.contourIndex == pinnedContourIndex } ?: return
-        val pixelLength = obj.pixelWidth
+        val target = prevObjects.firstOrNull { it.contourIndex == trackedContourIndex }
+            ?: prevObjects.maxByOrNull { it.area }
+            ?: return
+        val pixelLength = target.pixelWidth
         if (pixelLength <= 0.0) return
 
         speedPixelsPerMeter = pixelLength / (referenceLengthMm / 1000.0)
@@ -810,17 +840,30 @@ class MeasureViewModel @Inject constructor(
             emptySet()
         }
 
+        // Auto-pick the largest moving object when the user has not manually
+        // tapped one. This is the "just point the camera" simple path.
+        if (settled && !userPinned) {
+            val auto = result.detectedObjects
+                .filter { it.contourIndex in movingContourIndices }
+                .maxByOrNull { it.area }
+            if (auto == null) {
+                if (trackedContourIndex >= 0) clearSpeedPin()
+            } else if (auto.contourIndex != trackedContourIndex) {
+                seedTracker(auto)
+            }
+        }
+
         // Speed comes from the visual tracker (see ImageProcessor), whose
         // bounding-box centre is far more stable than a raw contour centroid.
-        if (settled && pinnedContourIndex >= 0 && result.speedTrackActive) {
+        if (settled && trackedContourIndex >= 0 && result.speedTrackActive) {
             updatePinnedSpeed(result.speedDisplacementPx, result.speedTrackRect, now)
         }
 
-        // Mark only moving contours plus the pinned target.
+        // Mark only moving contours plus the tracked target.
         val marked = movingContourIndices.toMutableSet()
-        if (pinnedContourIndex >= 0) marked.add(pinnedContourIndex)
+        if (trackedContourIndex >= 0) marked.add(trackedContourIndex)
         cameraManager.setMarkedContourIndices(marked)
-        cameraManager.setTargetContourIndex(if (pinnedContourIndex >= 0) pinnedContourIndex else -1)
+        cameraManager.setTargetContourIndex(if (trackedContourIndex >= 0) trackedContourIndex else -1)
 
         updateAggregateSpeedState(now)
         prevObjects = result.detectedObjects
@@ -901,9 +944,9 @@ class MeasureViewModel @Inject constructor(
     private fun rectBottomCenter(r: Rect): Point =
         Point(r.x + r.width / 2.0, (r.y + r.height).toDouble())
 
-    /** Fold the pinned target's stats into the top overlay readout. */
+    /** Fold the tracked target's stats into the top overlay readout. */
     private fun updateAggregateSpeedState(now: Long) {
-        if (pinnedContourIndex < 0) {
+        if (trackedContourIndex < 0) {
             if (_uiState.value.isTracking) {
                 _uiState.update { it.copy(isTracking = false, currentSpeed = 0.0) }
             }

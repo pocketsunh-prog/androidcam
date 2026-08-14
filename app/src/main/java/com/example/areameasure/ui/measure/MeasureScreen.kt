@@ -692,21 +692,21 @@ private fun SpeedControls(uiState: MeasureUiState, viewModel: MeasureViewModel) 
     Spacer(modifier = Modifier.height(8.dp))
 
     if (uiState.isCameraRunning && !uiState.isTracking) {
-        val movingCount = uiState.detectedObjects.count { it.isMoving }
         Text(
-            text = if (movingCount > 0) {
-                "$movingCount moving ${if (movingCount == 1) "object" else "objects"} marked — tap one to measure its speed"
-            } else {
-                "Point at a moving object, then tap it to measure its speed"
-            },
+            text = "Point at a moving object — speed is measured automatically",
             style = MaterialTheme.typography.bodyMedium,
             color = Color(0xFFAAAAAA)
         )
     } else if (uiState.isTracking) {
+        val pinned = uiState.selectedObjectIndex >= 0
         Text(
-            text = "Pinned — tracking selected object. Tap it again (or empty space) to release.",
+            text = if (pinned) {
+                "Locked on target — tap empty space to go back to auto"
+            } else {
+                "Auto-tracking fastest object — tap one to lock it"
+            },
             style = MaterialTheme.typography.bodyMedium,
-            color = Color(0xFFFFD54F)
+            color = if (pinned) Color(0xFFFFD54F) else Color(0xFF69F0AE)
         )
     } else if (!uiState.isCameraRunning) {
         Text(
@@ -716,11 +716,9 @@ private fun SpeedControls(uiState: MeasureUiState, viewModel: MeasureViewModel) 
         )
     }
 
-    // A real-world scale is required to report m/s; offer it once the user has
-    // pinned a moving object and no metric scale is available yet.
-    if (uiState.isCameraRunning && uiState.isTracking &&
-        !uiState.speedUsesMetric && uiState.selectedObjectIndex >= 0
-    ) {
+    // A real-world scale is required to report m/s; offer it whenever the camera
+    // is running and no metric scale is available yet.
+    if (uiState.isCameraRunning && !uiState.speedUsesMetric) {
         Spacer(modifier = Modifier.height(10.dp))
         Button(
             onClick = { viewModel.showSpeedCalibrationDialog() },
