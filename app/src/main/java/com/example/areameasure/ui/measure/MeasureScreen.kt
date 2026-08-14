@@ -1116,7 +1116,7 @@ private fun RaceControls(uiState: MeasureUiState, viewModel: MeasureViewModel) {
         modifier = Modifier.fillMaxWidth(),
         horizontalArrangement = Arrangement.Center
     ) {
-        listOf(60, 100, 200, 400, 800).forEachIndexed { index, m ->
+        listOf(60, 100, 200, 400).forEachIndexed { index, m ->
             DistanceButton(
                 meters = m,
                 selected = uiState.raceDistanceMeters == m,
