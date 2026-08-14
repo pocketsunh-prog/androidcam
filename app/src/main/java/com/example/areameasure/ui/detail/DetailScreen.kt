@@ -95,6 +95,10 @@ fun DetailScreen(
                         measurement = measurement.measurement,
                         modifier = Modifier.padding(padding)
                     )
+                    is DetailMeasurement.Race -> RaceDetailContent(
+                        measurement = measurement.measurement,
+                        modifier = Modifier.padding(padding)
+                    )
                 }
             } ?: Text(
                 "Measurement not found",
@@ -298,6 +302,67 @@ private fun PeopleDetailContent(
         DetailRow("Count", "${measurement.count}")
         DetailRow("Measured on", dateFormat.format(Date(measurement.timestamp)))
     }
+}
+
+@Composable
+private fun RaceDetailContent(
+    measurement: com.example.areameasure.data.model.RaceMeasurement,
+    modifier: Modifier = Modifier
+) {
+    val dateFormat = remember {
+        SimpleDateFormat("EEEE, MMMM d, yyyy 'at' h:mm:ss a", Locale.getDefault())
+    }
+
+    Column(
+        modifier = modifier
+            .fillMaxSize()
+            .verticalScroll(rememberScrollState())
+            .padding(16.dp)
+    ) {
+        measurement.imagePath?.let { path ->
+            AsyncImage(
+                model = File(path),
+                contentDescription = "Finish photo",
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .height(250.dp),
+                contentScale = ContentScale.Fit
+            )
+            Spacer(modifier = Modifier.height(16.dp))
+        }
+
+        Text(
+            text = "Finish time",
+            style = MaterialTheme.typography.labelLarge,
+            color = MaterialTheme.colorScheme.onSurfaceVariant
+        )
+        Text(
+            text = formatRaceTime(measurement.timeMs),
+            style = MaterialTheme.typography.displayMedium,
+            color = Color(0xFFFFC107)
+        )
+        Text(
+            text = "${measurement.distanceMeters} m race",
+            style = MaterialTheme.typography.titleMedium,
+            color = Color(0xFFFFD54F)
+        )
+
+        Spacer(modifier = Modifier.height(16.dp))
+        HorizontalDivider()
+        Spacer(modifier = Modifier.height(16.dp))
+
+        DetailRow("Time", formatRaceTime(measurement.timeMs))
+        DetailRow("Distance", "${measurement.distanceMeters} m")
+        DetailRow("Measured on", dateFormat.format(Date(measurement.timestamp)))
+    }
+}
+
+private fun formatRaceTime(ms: Long): String {
+    val total = ms.coerceAtLeast(0L)
+    val minutes = total / 60_000L
+    val seconds = (total % 60_000L) / 1_000L
+    val millis = total % 1_000L
+    return "%02d.%02d.%03d".format(minutes, seconds, millis)
 }
 
 @Composable

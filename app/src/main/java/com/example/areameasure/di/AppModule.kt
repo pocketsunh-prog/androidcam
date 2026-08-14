@@ -5,10 +5,12 @@ import androidx.room.Room
 import com.example.areameasure.data.local.AppDatabase
 import com.example.areameasure.data.local.MeasurementDao
 import com.example.areameasure.data.local.PeopleCountDao
+import com.example.areameasure.data.local.RaceDao
 import com.example.areameasure.data.local.RunningPostureDao
 import com.example.areameasure.data.local.SpeedDao
 import com.example.areameasure.data.repository.MeasurementRepository
 import com.example.areameasure.data.repository.PeopleCountRepository
+import com.example.areameasure.data.repository.RaceRepository
 import com.example.areameasure.data.repository.RunningPostureRepository
 import com.example.areameasure.data.repository.SpeedRepository
 import com.example.areameasure.processing.ImageProcessor
@@ -61,6 +63,12 @@ object AppModule {
 
     @Provides
     @Singleton
+    fun provideRaceDao(database: AppDatabase): RaceDao {
+        return database.raceDao()
+    }
+
+    @Provides
+    @Singleton
     fun provideMeasurementRepository(dao: MeasurementDao): MeasurementRepository {
         return MeasurementRepository(dao)
     }
@@ -81,6 +89,12 @@ object AppModule {
     @Singleton
     fun provideRunningPostureRepository(dao: RunningPostureDao): RunningPostureRepository {
         return RunningPostureRepository(dao)
+    }
+
+    @Provides
+    @Singleton
+    fun provideRaceRepository(dao: RaceDao): RaceRepository {
+        return RaceRepository(dao)
     }
 
     @Provides

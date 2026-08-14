@@ -31,6 +31,13 @@ class PoseDetector {
         val trunkLeanDegrees: Double?
     )
 
+    /** Torso centre position, used for finish-line crossing detection. */
+    data class TorsoResult(
+        val hasPose: Boolean,
+        /** Torso centre x, normalised to 0..1 across the image width. */
+        val centerXNormalized: Float?
+    )
+
     private val detector = PoseDetection.getClient(
         AccuratePoseDetectorOptions.Builder()
             .setDetectorMode(AccuratePoseDetectorOptions.STREAM_MODE)
@@ -51,8 +58,36 @@ class PoseDetector {
         }
     }
 
+    /**
+     * Runs pose detection and returns the torso centre x, normalised to the
+     * image width (0..1). Used by the race timer to detect a finish-line cross.
+     */
+    fun detectTorsoCenterX(image: InputImage): TorsoResult {
+        return try {
+            val pose = Tasks.await(detector.process(image))
+            torsoCenter(pose, image.width)
+        } catch (e: Exception) {
+            Log.e(TAG, "Pose detection failed", e)
+            TorsoResult(hasPose = false, centerXNormalized = null)
+        }
+    }
+
     fun close() {
         detector.close()
+    }
+
+    private fun torsoCenter(pose: Pose, imageWidth: Int): TorsoResult {
+        val landmarks = pose.allPoseLandmarks
+        val shoulder = midpoint(landmarks, PoseLandmark.LEFT_SHOULDER, PoseLandmark.RIGHT_SHOULDER)
+        val hip = midpoint(landmarks, PoseLandmark.LEFT_HIP, PoseLandmark.RIGHT_HIP)
+        if (shoulder == null || hip == null || imageWidth <= 0) {
+            return TorsoResult(hasPose = false, centerXNormalized = null)
+        }
+        val cx = (shoulder.x + hip.x) / 2f
+        return TorsoResult(
+            hasPose = true,
+            centerXNormalized = (cx / imageWidth).coerceIn(0f, 1f)
+        )
     }
 
     private fun evaluate(pose: Pose): Result {

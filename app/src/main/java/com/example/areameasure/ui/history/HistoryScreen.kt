@@ -21,6 +21,7 @@ import androidx.compose.material.icons.filled.Person
 import androidx.compose.material.icons.filled.PhotoCamera
 import androidx.compose.material.icons.filled.Speed
 import androidx.compose.material.icons.filled.SquareFoot
+import androidx.compose.material.icons.filled.Timer
 import androidx.compose.material3.Card
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.Icon
@@ -46,6 +47,7 @@ import androidx.hilt.navigation.compose.hiltViewModel
 import coil.compose.AsyncImage
 import com.example.areameasure.data.model.Measurement
 import com.example.areameasure.data.model.PeopleCountMeasurement
+import com.example.areameasure.data.model.RaceMeasurement
 import com.example.areameasure.data.model.SpeedMeasurement
 import com.example.areameasure.domain.SpeedTracker
 import java.io.File
@@ -63,6 +65,7 @@ fun HistoryScreen(
     val measurements by viewModel.measurements.collectAsState()
     val speedMeasurements by viewModel.speedMeasurements.collectAsState()
     val peopleMeasurements by viewModel.peopleMeasurements.collectAsState()
+    val raceMeasurements by viewModel.raceMeasurements.collectAsState()
     val selectedTab = remember { mutableIntStateOf(0) }
 
     Scaffold(
@@ -102,6 +105,12 @@ fun HistoryScreen(
                     text = { Text("People") },
                     icon = { Icon(Icons.Default.Person, contentDescription = null) }
                 )
+                Tab(
+                    selected = selectedTab.intValue == 3,
+                    onClick = { selectedTab.intValue = 3 },
+                    text = { Text("Race") },
+                    icon = { Icon(Icons.Default.Timer, contentDescription = null) }
+                )
             }
 
             // Tab content
@@ -117,6 +126,10 @@ fun HistoryScreen(
                 2 -> PeopleCountList(
                     measurements = peopleMeasurements,
                     onItemClick = { id -> onNavigateToDetail("people", id) }
+                )
+                3 -> RaceMeasurementList(
+                    measurements = raceMeasurements,
+                    onItemClick = { id -> onNavigateToDetail("race", id) }
                 )
             }
         }
@@ -265,6 +278,99 @@ private fun PeopleCountList(
             item { Spacer(modifier = Modifier.height(8.dp)) }
         }
     }
+}
+
+/**
+ * List of race-time results.
+ */
+@Composable
+private fun RaceMeasurementList(
+    measurements: List<RaceMeasurement>,
+    onItemClick: (Long) -> Unit
+) {
+    if (measurements.isEmpty()) {
+        EmptyState(message = "No race results yet")
+    } else {
+        LazyColumn(
+            modifier = Modifier
+                .fillMaxSize()
+                .padding(horizontal = 16.dp),
+            verticalArrangement = Arrangement.spacedBy(8.dp)
+        ) {
+            item { Spacer(modifier = Modifier.height(4.dp)) }
+            items(measurements, key = { it.id }) { measurement ->
+                RaceMeasurementCard(
+                    measurement = measurement,
+                    onClick = { onItemClick(measurement.id) }
+                )
+            }
+            item { Spacer(modifier = Modifier.height(8.dp)) }
+        }
+    }
+}
+
+@Composable
+private fun RaceMeasurementCard(
+    measurement: RaceMeasurement,
+    onClick: () -> Unit
+) {
+    val dateFormat = remember { SimpleDateFormat("MMM d, yyyy • h:mm a", Locale.getDefault()) }
+
+    Card(
+        modifier = Modifier
+            .fillMaxWidth()
+            .clickable(onClick = onClick),
+        shape = RoundedCornerShape(12.dp)
+    ) {
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(12.dp),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Box(
+                modifier = Modifier
+                    .size(64.dp)
+                    .clip(RoundedCornerShape(8.dp)),
+                contentAlignment = Alignment.Center
+            ) {
+                Icon(
+                    Icons.Default.Timer,
+                    contentDescription = null,
+                    modifier = Modifier.size(40.dp),
+                    tint = Color(0xFFFFC107)
+                )
+            }
+
+            Spacer(modifier = Modifier.width(12.dp))
+
+            Column(modifier = Modifier.weight(1f)) {
+                Text(
+                    text = formatRaceTime(measurement.timeMs),
+                    style = MaterialTheme.typography.titleMedium
+                )
+                Spacer(modifier = Modifier.height(2.dp))
+                Text(
+                    text = "${measurement.distanceMeters} m race",
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = Color(0xFFFFC107)
+                )
+                Text(
+                    text = dateFormat.format(Date(measurement.timestamp)),
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+            }
+        }
+    }
+}
+
+private fun formatRaceTime(ms: Long): String {
+    val total = ms.coerceAtLeast(0L)
+    val minutes = total / 60_000L
+    val seconds = (total % 60_000L) / 1_000L
+    val millis = total % 1_000L
+    return "%02d.%02d.%03d".format(minutes, seconds, millis)
 }
 
 @Composable

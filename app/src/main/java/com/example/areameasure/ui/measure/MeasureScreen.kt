@@ -3,6 +3,7 @@ package com.example.areameasure.ui.measure
 import android.Manifest
 import android.content.Context
 import android.content.pm.PackageManager
+import android.os.SystemClock
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.Image
@@ -42,6 +43,7 @@ import androidx.compose.material.icons.filled.RestartAlt
 import androidx.compose.material.icons.filled.Speed
 import androidx.compose.material.icons.filled.SquareFoot
 import androidx.compose.material.icons.filled.Stop
+import androidx.compose.material.icons.filled.Timer
 import androidx.compose.material.icons.filled.Videocam
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
@@ -64,6 +66,7 @@ import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.MutableState
+import androidx.compose.runtime.mutableLongStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
@@ -87,6 +90,7 @@ import androidx.hilt.navigation.compose.hiltViewModel
 import androidx.camera.core.Preview
 import androidx.camera.view.PreviewView
 import androidx.compose.ui.viewinterop.AndroidView
+import kotlinx.coroutines.delay
 import com.example.areameasure.data.model.UnitOfMeasure
 import com.example.areameasure.domain.MeasureMode
 import com.example.areameasure.domain.RunType
@@ -108,6 +112,7 @@ private fun CameraPreviewArea(
 ) {
     val isSpeed = uiState.mode == MeasureMode.SPEED
     val isRunning = uiState.mode == MeasureMode.RUNNING
+    val isRace = uiState.mode == MeasureMode.RACE
     val zoomEnabled = isSpeed || isRunning
     Box(
         modifier = Modifier
@@ -166,6 +171,8 @@ private fun CameraPreviewArea(
                                     MeasureMode.RUNNING -> Unit
                                     // FAN is fully automatic.
                                     MeasureMode.FAN -> Unit
+                                    // RACE has a Start button, no tap-to-select.
+                                    MeasureMode.RACE -> Unit
                                 }
                             }
                         }
@@ -234,6 +241,18 @@ private fun CameraPreviewArea(
                 rpm = uiState.fanRpm,
                 passFrequencyHz = uiState.fanPassFrequencyHz,
                 bladeCount = uiState.bladeCount,
+                modifier = Modifier.align(Alignment.TopCenter)
+            )
+        }
+
+        // RACE: finish line (centre) + live timer overlay.
+        if (isRace && uiState.isCameraRunning) {
+            FinishLineOverlay()
+            RaceTimerOverlay(
+                isRunning = uiState.isRaceRunning,
+                startedAtMs = uiState.raceStartedAtMs,
+                finalMs = uiState.raceFinalMs,
+                formatTime = viewModel::formatRaceTime,
                 modifier = Modifier.align(Alignment.TopCenter)
             )
         }
@@ -329,6 +348,7 @@ private fun ModeControls(uiState: MeasureUiState, viewModel: MeasureViewModel) {
         MeasureMode.PEOPLE -> PeopleControls(uiState = uiState, viewModel = viewModel)
         MeasureMode.RUNNING -> RunningControls(uiState = uiState, viewModel = viewModel)
         MeasureMode.FAN -> FanControls(uiState = uiState, viewModel = viewModel)
+        MeasureMode.RACE -> RaceControls(uiState = uiState, viewModel = viewModel)
     }
 }
 
@@ -515,6 +535,18 @@ fun MeasureScreen(
         )
     }
 
+    // RACE: saved time confirmation.
+    uiState.raceSavedMessage?.let { msg ->
+        AlertDialog(
+            onDismissRequest = { viewModel.dismissRaceSavedDialog() },
+            title = { Text("Finished") },
+            text = { Text("Time: $msg") },
+            confirmButton = {
+                TextButton(onClick = { viewModel.dismissRaceSavedDialog() }) { Text("OK") }
+            }
+        )
+    }
+
     // Clear memory confirmation
     if (showClearMemoryDialog) {
         AlertDialog(
@@ -604,7 +636,13 @@ private fun MeasureModeToggle(
                 modifier = Modifier.weight(1f)
             )
             Spacer(modifier = Modifier.width(4.dp))
-            Spacer(modifier = Modifier.weight(1f))
+            ModeButton(
+                label = "Race",
+                icon = Icons.Default.Timer,
+                selected = selected == MeasureMode.RACE,
+                onClick = { onSelect(MeasureMode.RACE) },
+                modifier = Modifier.weight(1f)
+            )
         }
     }
 }
@@ -1066,6 +1104,164 @@ private fun FanOverlay(
                 color = Color(0xFF888888)
             )
         }
+    }
+}
+
+// ---------------------------------------------------------------- RACE controls
+
+@Composable
+private fun RaceControls(uiState: MeasureUiState, viewModel: MeasureViewModel) {
+    // Distance presets + custom (no limit) input.
+    Row(
+        modifier = Modifier.fillMaxWidth(),
+        horizontalArrangement = Arrangement.Center
+    ) {
+        listOf(60, 100, 200, 400, 800).forEachIndexed { index, m ->
+            DistanceButton(
+                meters = m,
+                selected = uiState.raceDistanceMeters == m,
+                onClick = { viewModel.selectRaceDistance(m) },
+                modifier = Modifier.weight(1f)
+            )
+            if (index < 4) Spacer(modifier = Modifier.width(3.dp))
+        }
+    }
+
+    Spacer(modifier = Modifier.height(6.dp))
+
+    var distanceText by remember(uiState.raceDistanceMeters) {
+        mutableStateOf(uiState.raceDistanceMeters.toString())
+    }
+    OutlinedTextField(
+        value = distanceText,
+        onValueChange = {
+            distanceText = it
+            viewModel.setCustomRaceDistance(it)
+        },
+        label = { Text("Distance (m)") },
+        singleLine = true,
+        modifier = Modifier.fillMaxWidth()
+    )
+
+    Spacer(modifier = Modifier.height(10.dp))
+
+    if (!uiState.isRaceRunning && uiState.raceFinalMs == null) {
+        Button(
+            onClick = { viewModel.startRace() },
+            enabled = uiState.isCameraRunning,
+            colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF4CAF50))
+        ) {
+            Icon(Icons.Default.PlayArrow, contentDescription = null, modifier = Modifier.size(18.dp))
+            Spacer(modifier = Modifier.width(6.dp))
+            Text("Start")
+        }
+        Spacer(modifier = Modifier.height(8.dp))
+        Text(
+            text = "Aim the centre line at the finish line, then press Start",
+            style = MaterialTheme.typography.bodyMedium,
+            color = Color(0xFFAAAAAA)
+        )
+    } else if (uiState.isRaceRunning) {
+        Text(
+            text = "Timing… cross the centre line to stop",
+            style = MaterialTheme.typography.bodyMedium,
+            color = Color(0xFF69F0AE)
+        )
+    } else {
+        Text(
+            text = "Result: ${viewModel.formatRaceTime(uiState.raceFinalMs ?: 0L)} · ${uiState.raceDistanceMeters} m",
+            style = MaterialTheme.typography.bodyMedium,
+            color = Color(0xFF69F0AE)
+        )
+        Spacer(modifier = Modifier.height(8.dp))
+        Button(
+            onClick = { viewModel.startRace() },
+            enabled = uiState.isCameraRunning,
+            colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF4CAF50))
+        ) {
+            Text("Run again")
+        }
+    }
+}
+
+@Composable
+private fun DistanceButton(
+    meters: Int,
+    selected: Boolean,
+    onClick: () -> Unit,
+    modifier: Modifier = Modifier
+) {
+    Button(
+        onClick = onClick,
+        modifier = modifier.height(40.dp),
+        colors = if (selected) ButtonDefaults.buttonColors()
+                 else ButtonDefaults.outlinedButtonColors(),
+        border = if (selected) null else ButtonDefaults.outlinedButtonBorder
+    ) {
+        Text("$meters")
+    }
+}
+
+@Composable
+private fun FinishLineOverlay() {
+    Box(
+        modifier = Modifier
+            .fillMaxSize()
+            .padding(vertical = 8.dp)
+    ) {
+        Box(
+            modifier = Modifier
+                .align(Alignment.Center)
+                .width(3.dp)
+                .fillMaxHeight()
+                .background(Color(0xFFFFEB3B).copy(alpha = 0.8f))
+        )
+    }
+}
+
+@Composable
+private fun RaceTimerOverlay(
+    isRunning: Boolean,
+    startedAtMs: Long,
+    finalMs: Long?,
+    formatTime: (Long) -> String,
+    modifier: Modifier = Modifier
+) {
+    var now by remember { mutableLongStateOf(SystemClock.elapsedRealtime()) }
+
+    LaunchedEffect(isRunning) {
+        while (isRunning) {
+            now = SystemClock.elapsedRealtime()
+            delay(16)
+        }
+    }
+
+    val displayMs = when {
+        isRunning -> now - startedAtMs
+        finalMs != null -> finalMs
+        else -> 0L
+    }
+
+    Column(
+        modifier = modifier
+            .fillMaxWidth()
+            .padding(12.dp)
+            .background(Color.Black.copy(alpha = 0.7f), RoundedCornerShape(12.dp))
+            .padding(12.dp),
+        horizontalAlignment = Alignment.CenterHorizontally
+    ) {
+        Icon(
+            Icons.Default.Timer,
+            contentDescription = null,
+            tint = Color(0xFFFFEB3B),
+            modifier = Modifier.size(28.dp)
+        )
+        Text(
+            text = formatTime(displayMs),
+            style = MaterialTheme.typography.headlineMedium,
+            fontWeight = FontWeight.Bold,
+            color = Color.White
+        )
     }
 }
 

@@ -8,9 +8,10 @@ import androidx.room.RoomDatabase
         MeasurementEntity::class,
         SpeedEntity::class,
         PeopleCountEntity::class,
-        RunningPostureEntity::class
+        RunningPostureEntity::class,
+        RaceEntity::class
     ],
-    version = 5,
+    version = 7,
     exportSchema = false
 )
 abstract class AppDatabase : RoomDatabase() {
@@ -18,4 +19,5 @@ abstract class AppDatabase : RoomDatabase() {
     abstract fun speedDao(): SpeedDao
     abstract fun peopleCountDao(): PeopleCountDao
     abstract fun runningPostureDao(): RunningPostureDao
+    abstract fun raceDao(): RaceDao
 }

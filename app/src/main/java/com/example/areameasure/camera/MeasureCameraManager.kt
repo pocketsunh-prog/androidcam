@@ -68,6 +68,10 @@ class MeasureCameraManager @Inject constructor(
         _fanResults.value = result
     }
 
+    private val raceAnalyzer = RaceFinishAnalyzer(poseDetector) { result ->
+        _raceResults.value = result
+    }
+
     private val _processingResults = MutableStateFlow<ImageProcessor.ProcessingResult?>(null)
     val processingResults: StateFlow<ImageProcessor.ProcessingResult?> = _processingResults.asStateFlow()
 
@@ -76,6 +80,9 @@ class MeasureCameraManager @Inject constructor(
 
     private val _fanResults = MutableStateFlow<FanSpeedAnalyzer.FanSpeedResult?>(null)
     val fanResults: StateFlow<FanSpeedAnalyzer.FanSpeedResult?> = _fanResults.asStateFlow()
+
+    private val _raceResults = MutableStateFlow<PoseDetector.TorsoResult?>(null)
+    val raceResults: StateFlow<PoseDetector.TorsoResult?> = _raceResults.asStateFlow()
 
     private var analysisExecutor = Executors.newSingleThreadExecutor()
 
@@ -119,6 +126,7 @@ class MeasureCameraManager @Inject constructor(
 
             val isRunning = measureMode == MeasureMode.RUNNING
             val isFan = measureMode == MeasureMode.FAN
+            val isRace = measureMode == MeasureMode.RACE
 
             // OpenCV processing flags.
             imageProcessor.drawAxes = measureMode == MeasureMode.SIZE
@@ -149,11 +157,13 @@ class MeasureCameraManager @Inject constructor(
             } else if (isFan) {
                 fanAnalyzer.reset()
                 imageAnalysis!!.setAnalyzer(analysisExecutor, fanAnalyzer)
+            } else if (isRace) {
+                imageAnalysis!!.setAnalyzer(analysisExecutor, raceAnalyzer)
             } else {
                 imageAnalysis!!.setAnalyzer(analysisExecutor, analyzer)
             }
 
-            imageCapture = if (measureMode == MeasureMode.SIZE || isRunning) {
+            imageCapture = if (measureMode == MeasureMode.SIZE || isRunning || isRace) {
                 ImageCapture.Builder()
                     .setCaptureMode(ImageCapture.CAPTURE_MODE_MINIMIZE_LATENCY)
                     .build()
@@ -188,8 +198,9 @@ class MeasureCameraManager @Inject constructor(
         }
     }
 
-    /** Capture a photo without unbinding preview/analysis (RUNNING keeps 3 use cases). */
-    fun captureRunningPhoto(
+    /** Capture a photo without unbinding preview/analysis (3-use-case modes). */
+    fun capturePhoto(
+        prefix: String,
         onSaved: (String) -> Unit,
         onError: (Exception) -> Unit
     ) {
@@ -197,7 +208,7 @@ class MeasureCameraManager @Inject constructor(
             onError(IllegalStateException("Camera not initialized"))
             return
         }
-        val file = File(context.filesDir, "running_${System.currentTimeMillis()}.jpg")
+        val file = File(context.filesDir, "${prefix}_${System.currentTimeMillis()}.jpg")
         val outputOptions = ImageCapture.OutputFileOptions.Builder(file).build()
 
         capture.takePicture(

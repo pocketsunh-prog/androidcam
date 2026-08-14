@@ -1,15 +1,18 @@
 package com.example.areameasure.ui.measure
 
 import android.graphics.Bitmap
+import android.os.SystemClock
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import com.example.areameasure.camera.MeasureCameraManager
 import com.example.areameasure.data.model.Measurement
 import com.example.areameasure.data.model.PeopleCountMeasurement
+import com.example.areameasure.data.model.RaceMeasurement
 import com.example.areameasure.data.model.RunningPostureMeasurement
 import com.example.areameasure.data.model.UnitOfMeasure
 import com.example.areameasure.data.repository.MeasurementRepository
 import com.example.areameasure.data.repository.PeopleCountRepository
+import com.example.areameasure.data.repository.RaceRepository
 import com.example.areameasure.data.repository.RunningPostureRepository
 import com.example.areameasure.data.repository.SpeedRepository
 import com.example.areameasure.domain.AreaCalculator
@@ -17,13 +20,16 @@ import com.example.areameasure.domain.MeasureMode
 import com.example.areameasure.domain.PerspectiveCalibration
 import com.example.areameasure.domain.RunType
 import com.example.areameasure.processing.ImageProcessor
+import com.example.areameasure.processing.RunnerPhotoAnnotator
 import dagger.hilt.android.lifecycle.HiltViewModel
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import org.opencv.core.Point
 import org.opencv.core.Rect
 import org.opencv.imgproc.Imgproc
@@ -145,7 +151,20 @@ data class MeasureUiState(
     /** Normalised motion energy of the detected region (0..1). */
     val fanEnergy: Double = 0.0,
     /** Number of samples accumulated by the fan analyzer. */
-    val fanSampleCount: Int = 0
+    val fanSampleCount: Int = 0,
+    // --- RACE mode ---
+    /** Race distance in metres (presets: 100/200/400/800, or custom). */
+    val raceDistanceMeters: Int = 400,
+    /** True while the race timer is running. */
+    val isRaceRunning: Boolean = false,
+    /** [SystemClock.elapsedRealtime] when the race started (0 = not started). */
+    val raceStartedAtMs: Long = 0L,
+    /** Final time in milliseconds once the finish line was crossed (null until then). */
+    val raceFinalMs: Long? = null,
+    /** Auto-captured finish photo path. */
+    val racePhotoPath: String? = null,
+    /** Non-null shows the saved race-time confirmation dialog. */
+    val raceSavedMessage: String? = null
 )
 
 @HiltViewModel
@@ -154,7 +173,8 @@ class MeasureViewModel @Inject constructor(
     private val measurementRepository: MeasurementRepository,
     private val speedRepository: SpeedRepository,
     private val peopleCountRepository: PeopleCountRepository,
-    private val runningPostureRepository: RunningPostureRepository
+    private val runningPostureRepository: RunningPostureRepository,
+    private val raceRepository: RaceRepository
 ) : ViewModel() {
 
     private val _uiState = MutableStateFlow(MeasureUiState())
@@ -163,6 +183,10 @@ class MeasureViewModel @Inject constructor(
     private var processingCollectionJob: Job? = null
     private var poseCollectionJob: Job? = null
     private var fanCollectionJob: Job? = null
+    private var raceCollectionJob: Job? = null
+
+    /** Last known side of the finish line for the race timer (-1 left, +1 right, 0 unknown). */
+    private var raceLastSide: Int = 0
 
     // --- SIZE calibration state ---
 
@@ -279,7 +303,12 @@ class MeasureViewModel @Inject constructor(
                 fanPassFrequencyHz = null,
                 fanRpm = null,
                 fanEnergy = 0.0,
-                fanSampleCount = 0
+                fanSampleCount = 0,
+                isRaceRunning = false,
+                raceStartedAtMs = 0L,
+                raceFinalMs = null,
+                racePhotoPath = null,
+                raceSavedMessage = null
             )
         }
     }
@@ -318,6 +347,8 @@ class MeasureViewModel @Inject constructor(
         poseCollectionJob = null
         fanCollectionJob?.cancel()
         fanCollectionJob = null
+        raceCollectionJob?.cancel()
+        raceCollectionJob = null
         prevObjects = emptyList()
         movingContourIndices = emptySet()
         cameraStartedAtMs = 0L
@@ -340,7 +371,11 @@ class MeasureViewModel @Inject constructor(
                 fanPassFrequencyHz = null,
                 fanRpm = null,
                 fanEnergy = 0.0,
-                fanSampleCount = 0
+                fanSampleCount = 0,
+                isRaceRunning = false,
+                raceStartedAtMs = 0L,
+                raceFinalMs = null,
+                racePhotoPath = null
             )
         }
     }
@@ -382,7 +417,12 @@ class MeasureViewModel @Inject constructor(
                 fanPassFrequencyHz = null,
                 fanRpm = null,
                 fanEnergy = 0.0,
-                fanSampleCount = 0
+                fanSampleCount = 0,
+                isRaceRunning = false,
+                raceStartedAtMs = 0L,
+                raceFinalMs = null,
+                racePhotoPath = null,
+                raceSavedMessage = null
             )
         }
     }
@@ -397,6 +437,7 @@ class MeasureViewModel @Inject constructor(
             val speedMeasurements = speedRepository.getAllMeasurementsOnce()
             val peopleMeasurements = peopleCountRepository.getAllMeasurementsOnce()
             val runningMeasurements = runningPostureRepository.getAllMeasurementsOnce()
+            val raceMeasurements = raceRepository.getAllMeasurementsOnce()
 
             sizeMeasurements.forEach { m ->
                 try {
@@ -428,11 +469,20 @@ class MeasureViewModel @Inject constructor(
                     }
                 }
             }
+            raceMeasurements.forEach { m ->
+                m.imagePath?.let { path ->
+                    try {
+                        java.io.File(path).delete()
+                    } catch (_: Exception) {
+                    }
+                }
+            }
 
             measurementRepository.deleteAllMeasurements()
             speedRepository.deleteAllMeasurements()
             peopleCountRepository.deleteAllMeasurements()
             runningPostureRepository.deleteAllMeasurements()
+            raceRepository.deleteAllMeasurements()
             onDone()
         }
     }
@@ -452,6 +502,7 @@ class MeasureViewModel @Inject constructor(
                     MeasureMode.SIZE -> { /* dimensions computed below */ }
                     MeasureMode.RUNNING -> { /* pose handled by the pose collector */ }
                     MeasureMode.FAN -> { /* fan speed handled by the fan collector */ }
+                    MeasureMode.RACE -> { /* race handled by the race collector */ }
                 }
 
                 // Map each detected contour to its live status so the overlay can
@@ -550,6 +601,32 @@ class MeasureViewModel @Inject constructor(
                         fanEnergy = result.energy,
                         fanSampleCount = result.sampleCount
                     )
+                }
+            }
+        }
+
+        // RACE mode finish-line stream.
+        raceCollectionJob?.cancel()
+        raceCollectionJob = viewModelScope.launch {
+            cameraManager.raceResults.collect { result ->
+                if (_uiState.value.mode != MeasureMode.RACE) return@collect
+                if (result == null || !result.hasPose) return@collect
+                if (!_uiState.value.isRaceRunning) return@collect
+                val cx = result.centerXNormalized ?: return@collect
+
+                val side = when {
+                    cx < FINISH_LINE_X - FINISH_HYSTERESIS -> -1
+                    cx > FINISH_LINE_X + FINISH_HYSTERESIS -> 1
+                    else -> 0
+                }
+                if (side == 0) return@collect
+                if (raceLastSide == 0) {
+                    raceLastSide = side
+                    return@collect
+                }
+                if (side != raceLastSide) {
+                    raceLastSide = side
+                    finishRace()
                 }
             }
         }
@@ -1066,7 +1143,8 @@ class MeasureViewModel @Inject constructor(
 
     fun captureRunningPhoto() {
         if (_uiState.value.mode != MeasureMode.RUNNING) return
-        cameraManager.captureRunningPhoto(
+        cameraManager.capturePhoto(
+            prefix = "running",
             onSaved = { path -> saveRunningCapture(imagePath = path, videoPath = null) },
             onError = { e ->
                 _uiState.update { it.copy(errorMessage = "Photo failed: ${e.message}") }
@@ -1128,6 +1206,92 @@ class MeasureViewModel @Inject constructor(
                 fanRpm = passHz?.let { hz -> hz * 60.0 / count }
             )
         }
+    }
+
+    // ---------------------------------------------------------------- RACE mode
+
+    /** Set the race distance from a preset (100/200/400/800 m). */
+    fun selectRaceDistance(meters: Int) {
+        if (meters <= 0) return
+        _uiState.update { it.copy(raceDistanceMeters = meters) }
+    }
+
+    /** Set a custom race distance (no limit); invalid input is ignored. */
+    fun setCustomRaceDistance(text: String) {
+        val meters = text.trim().toIntOrNull() ?: return
+        if (meters <= 0) return
+        _uiState.update { it.copy(raceDistanceMeters = meters) }
+    }
+
+    /** Start the race timer and arm finish-line crossing detection. */
+    fun startRace() {
+        if (_uiState.value.mode != MeasureMode.RACE) return
+        raceLastSide = 0
+        _uiState.update {
+            it.copy(
+                isRaceRunning = true,
+                raceStartedAtMs = SystemClock.elapsedRealtime(),
+                raceFinalMs = null,
+                racePhotoPath = null,
+                raceSavedMessage = null
+            )
+        }
+    }
+
+    /** Stop the race timer, auto-capture a photo and save the result. */
+    private fun finishRace() {
+        val startedAt = _uiState.value.raceStartedAtMs
+        if (startedAt <= 0L) return
+        val finalMs = SystemClock.elapsedRealtime() - startedAt
+        _uiState.update {
+            it.copy(isRaceRunning = false, raceFinalMs = finalMs)
+        }
+
+        cameraManager.capturePhoto(
+            prefix = "race",
+            onSaved = { path ->
+                viewModelScope.launch {
+                    val timeText = formatRaceTime(finalMs)
+                    val annotated = withContext(Dispatchers.IO) {
+                        RunnerPhotoAnnotator.annotate(path, timeText)
+                    }
+                    saveRaceResult(finalMs, annotated ?: path)
+                }
+            },
+            onError = { e ->
+                viewModelScope.launch { saveRaceResult(finalMs, null) }
+                _uiState.update { it.copy(errorMessage = "Photo failed: ${e.message}") }
+            }
+        )
+    }
+
+    private suspend fun saveRaceResult(timeMs: Long, imagePath: String?) {
+        val measurement = RaceMeasurement(
+            distanceMeters = _uiState.value.raceDistanceMeters,
+            timeMs = timeMs,
+            imagePath = imagePath,
+            timestamp = System.currentTimeMillis()
+        )
+        raceRepository.saveMeasurement(measurement)
+        _uiState.update {
+            it.copy(
+                racePhotoPath = imagePath,
+                raceSavedMessage = formatRaceTime(timeMs)
+            )
+        }
+    }
+
+    fun dismissRaceSavedDialog() {
+        _uiState.update { it.copy(raceSavedMessage = null) }
+    }
+
+    /** Format a duration in milliseconds as MM.SS.mmm. */
+    fun formatRaceTime(ms: Long): String {
+        val total = ms.coerceAtLeast(0L)
+        val minutes = total / 60_000L
+        val seconds = (total % 60_000L) / 1_000L
+        val millis = total % 1_000L
+        return "%02d.%02d.%03d".format(minutes, seconds, millis)
     }
 
     fun zoomIn() {
@@ -1224,6 +1388,7 @@ class MeasureViewModel @Inject constructor(
         processingCollectionJob?.cancel()
         poseCollectionJob?.cancel()
         fanCollectionJob?.cancel()
+        raceCollectionJob?.cancel()
     }
 
     private fun matToBitmap(mat: org.opencv.core.Mat): Bitmap? {
@@ -1277,6 +1442,12 @@ class MeasureViewModel @Inject constructor(
 
         /** Number of recent frames used to stabilise the PEOPLE face count. */
         private const val PEOPLE_COUNT_WINDOW = 5
+
+        /** Finish line x, normalised across the frame (centre line). */
+        private const val FINISH_LINE_X = 0.5f
+
+        /** Hysteresis band around the finish line to reject detection noise. */
+        private const val FINISH_HYSTERESIS = 0.03f
 
         private fun distance(x1: Double, y1: Double, x2: Double, y2: Double): Double {
             val dx = x2 - x1

@@ -5,9 +5,11 @@ import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import com.example.areameasure.data.model.Measurement
 import com.example.areameasure.data.model.PeopleCountMeasurement
+import com.example.areameasure.data.model.RaceMeasurement
 import com.example.areameasure.data.model.SpeedMeasurement
 import com.example.areameasure.data.repository.MeasurementRepository
 import com.example.areameasure.data.repository.PeopleCountRepository
+import com.example.areameasure.data.repository.RaceRepository
 import com.example.areameasure.data.repository.SpeedRepository
 import dagger.hilt.android.lifecycle.HiltViewModel
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -21,12 +23,14 @@ import javax.inject.Inject
 enum class DetailType {
     SIZE,
     SPEED,
-    PEOPLE;
+    PEOPLE,
+    RACE;
 
     companion object {
         fun fromRoute(value: String?): DetailType = when (value) {
             "speed" -> SPEED
             "people" -> PEOPLE
+            "race" -> RACE
             else -> SIZE
         }
     }
@@ -61,6 +65,14 @@ sealed interface DetailMeasurement {
         override val objectLabel: String get() = "${measurement.count} people"
         override val timestamp: Long get() = measurement.timestamp
     }
+
+    data class Race(
+        val measurement: RaceMeasurement
+    ) : DetailMeasurement {
+        override val id: Long get() = measurement.id
+        override val objectLabel: String get() = "${measurement.distanceMeters} m race"
+        override val timestamp: Long get() = measurement.timestamp
+    }
 }
 
 data class DetailUiState(
@@ -75,7 +87,8 @@ class DetailViewModel @Inject constructor(
     savedStateHandle: SavedStateHandle,
     private val measurementRepository: MeasurementRepository,
     private val speedRepository: SpeedRepository,
-    private val peopleCountRepository: PeopleCountRepository
+    private val peopleCountRepository: PeopleCountRepository,
+    private val raceRepository: RaceRepository
 ) : ViewModel() {
 
     private val type: DetailType =
@@ -98,6 +111,8 @@ class DetailViewModel @Inject constructor(
                     ?.let { DetailMeasurement.Speed(it) }
                 DetailType.PEOPLE -> peopleCountRepository.getMeasurement(measurementId)
                     ?.let { DetailMeasurement.People(it) }
+                DetailType.RACE -> raceRepository.getMeasurement(measurementId)
+                    ?.let { DetailMeasurement.Race(it) }
             }
             _uiState.update {
                 it.copy(measurement = measurement, isLoading = false)
@@ -127,6 +142,15 @@ class DetailViewModel @Inject constructor(
                 }
                 is DetailMeasurement.People -> {
                     peopleCountRepository.deleteMeasurement(current.measurement)
+                    current.measurement.imagePath?.let { path ->
+                        try {
+                            java.io.File(path).delete()
+                        } catch (_: Exception) {
+                        }
+                    }
+                }
+                is DetailMeasurement.Race -> {
+                    raceRepository.deleteMeasurement(current.measurement)
                     current.measurement.imagePath?.let { path ->
                         try {
                             java.io.File(path).delete()
