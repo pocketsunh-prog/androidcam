@@ -6,13 +6,16 @@ import androidx.lifecycle.viewModelScope
 import com.example.areameasure.camera.MeasureCameraManager
 import com.example.areameasure.data.model.Measurement
 import com.example.areameasure.data.model.PeopleCountMeasurement
+import com.example.areameasure.data.model.RunningPostureMeasurement
 import com.example.areameasure.data.model.UnitOfMeasure
 import com.example.areameasure.data.repository.MeasurementRepository
 import com.example.areameasure.data.repository.PeopleCountRepository
+import com.example.areameasure.data.repository.RunningPostureRepository
 import com.example.areameasure.data.repository.SpeedRepository
 import com.example.areameasure.domain.AreaCalculator
 import com.example.areameasure.domain.MeasureMode
 import com.example.areameasure.domain.PerspectiveCalibration
+import com.example.areameasure.domain.RunType
 import com.example.areameasure.processing.ImageProcessor
 import dagger.hilt.android.lifecycle.HiltViewModel
 import kotlinx.coroutines.Job
@@ -120,7 +123,18 @@ data class MeasureUiState(
     val overlayRotationDegrees: Int = 0,
     // --- PEOPLE mode ---
     /** Number of faces detected in the most recent frame (live count). */
-    val peopleCount: Int = 0
+    val peopleCount: Int = 0,
+    // --- RUNNING mode ---
+    /** Long-distance or sprint session type. */
+    val runType: RunType = RunType.LONG,
+    /** null = no pose detected; true = good (yellow); false = bad (red). */
+    val postureCorrect: Boolean? = null,
+    /** Absolute torso lean from vertical in degrees (null when no pose). */
+    val trunkLeanDegrees: Double? = null,
+    /** True while a running clip is being recorded. */
+    val isRecording: Boolean = false,
+    /** Non-null shows a "saved" confirmation dialog. */
+    val runningSavedMessage: String? = null
 )
 
 @HiltViewModel
@@ -128,13 +142,15 @@ class MeasureViewModel @Inject constructor(
     private val cameraManager: MeasureCameraManager,
     private val measurementRepository: MeasurementRepository,
     private val speedRepository: SpeedRepository,
-    private val peopleCountRepository: PeopleCountRepository
+    private val peopleCountRepository: PeopleCountRepository,
+    private val runningPostureRepository: RunningPostureRepository
 ) : ViewModel() {
 
     private val _uiState = MutableStateFlow(MeasureUiState())
     val uiState: StateFlow<MeasureUiState> = _uiState.asStateFlow()
 
     private var processingCollectionJob: Job? = null
+    private var poseCollectionJob: Job? = null
 
     // --- SIZE calibration state ---
 
@@ -240,7 +256,11 @@ class MeasureViewModel @Inject constructor(
                 showCalibrationDialog = false,
                 showSpeedCalibrationDialog = false,
                 isCapturing = false,
-                peopleCount = 0
+                peopleCount = 0,
+                postureCorrect = null,
+                trunkLeanDegrees = null,
+                isRecording = false,
+                runningSavedMessage = null
             )
         }
     }
@@ -275,6 +295,8 @@ class MeasureViewModel @Inject constructor(
         cameraManager.shutdown()
         processingCollectionJob?.cancel()
         processingCollectionJob = null
+        poseCollectionJob?.cancel()
+        poseCollectionJob = null
         prevObjects = emptyList()
         movingContourIndices = emptySet()
         cameraStartedAtMs = 0L
@@ -290,7 +312,10 @@ class MeasureViewModel @Inject constructor(
                 selectedPixelZ = null,
                 frameWidth = 0,
                 frameHeight = 0,
-                peopleCount = 0
+                peopleCount = 0,
+                postureCorrect = null,
+                trunkLeanDegrees = null,
+                isRecording = false
             )
         }
     }
@@ -324,7 +349,11 @@ class MeasureViewModel @Inject constructor(
                 showSpeedCalibrationDialog = false,
                 isCapturing = false,
                 lastCapturedImagePath = null,
-                peopleCount = 0
+                peopleCount = 0,
+                postureCorrect = null,
+                trunkLeanDegrees = null,
+                isRecording = false,
+                runningSavedMessage = null
             )
         }
     }
@@ -338,6 +367,7 @@ class MeasureViewModel @Inject constructor(
             val sizeMeasurements = measurementRepository.getAllMeasurementsOnce()
             val speedMeasurements = speedRepository.getAllMeasurementsOnce()
             val peopleMeasurements = peopleCountRepository.getAllMeasurementsOnce()
+            val runningMeasurements = runningPostureRepository.getAllMeasurementsOnce()
 
             sizeMeasurements.forEach { m ->
                 try {
@@ -361,10 +391,19 @@ class MeasureViewModel @Inject constructor(
                     }
                 }
             }
+            runningMeasurements.forEach { m ->
+                listOfNotNull(m.imagePath, m.videoPath).forEach { path ->
+                    try {
+                        java.io.File(path).delete()
+                    } catch (_: Exception) {
+                    }
+                }
+            }
 
             measurementRepository.deleteAllMeasurements()
             speedRepository.deleteAllMeasurements()
             peopleCountRepository.deleteAllMeasurements()
+            runningPostureRepository.deleteAllMeasurements()
             onDone()
         }
     }
@@ -382,6 +421,7 @@ class MeasureViewModel @Inject constructor(
                     MeasureMode.SPEED -> handleSpeedFrame(result)
                     MeasureMode.PEOPLE -> handlePeopleFrame(result)
                     MeasureMode.SIZE -> { /* dimensions computed below */ }
+                    MeasureMode.RUNNING -> { /* pose handled by the pose collector */ }
                 }
 
                 // Map each detected contour to its live status so the overlay can
@@ -445,6 +485,21 @@ class MeasureViewModel @Inject constructor(
                         calibrationWidthMm = sizeCalibration?.referenceWidthMm,
                         calibrationHeightMm = sizeCalibration?.referenceHeightMm,
                         speedUsesMetric = hasMetricScale()
+                    )
+                }
+            }
+        }
+
+        // RUNNING mode posture stream (separate from the OpenCV pipeline).
+        poseCollectionJob?.cancel()
+        poseCollectionJob = viewModelScope.launch {
+            cameraManager.runningPoseResults.collect { result ->
+                if (_uiState.value.mode != MeasureMode.RUNNING) return@collect
+                if (result == null) return@collect
+                _uiState.update {
+                    it.copy(
+                        postureCorrect = if (result.hasPose) result.isCorrect else null,
+                        trunkLeanDegrees = result.trunkLeanDegrees
                     )
                 }
             }
@@ -914,6 +969,64 @@ class MeasureViewModel @Inject constructor(
         }
     }
 
+    // ---------------------------------------------------------------- RUNNING mode
+
+    fun selectRunType(type: RunType) {
+        _uiState.update { it.copy(runType = type) }
+    }
+
+    fun captureRunningPhoto() {
+        if (_uiState.value.mode != MeasureMode.RUNNING) return
+        cameraManager.captureRunningPhoto(
+            onSaved = { path -> saveRunningCapture(imagePath = path, videoPath = null) },
+            onError = { e ->
+                _uiState.update { it.copy(errorMessage = "Photo failed: ${e.message}") }
+            }
+        )
+    }
+
+    fun startRunningRecording() {
+        if (_uiState.value.mode != MeasureMode.RUNNING) return
+        cameraManager.startRunningRecording(
+            onStarted = { _uiState.update { it.copy(isRecording = true) } },
+            onError = { e ->
+                _uiState.update { it.copy(errorMessage = "Recording failed: ${e.message}") }
+            }
+        )
+    }
+
+    fun stopRunningRecording() {
+        if (_uiState.value.mode != MeasureMode.RUNNING) return
+        cameraManager.stopRunningRecording { path ->
+            _uiState.update { it.copy(isRecording = false) }
+            saveRunningCapture(imagePath = null, videoPath = path)
+        }
+    }
+
+    private fun saveRunningCapture(imagePath: String?, videoPath: String?) {
+        val state = _uiState.value
+        val measurement = RunningPostureMeasurement(
+            runType = state.runType,
+            isCorrectPosture = state.postureCorrect ?: false,
+            trunkLeanDegrees = state.trunkLeanDegrees ?: 0.0,
+            imagePath = imagePath,
+            videoPath = videoPath,
+            timestamp = System.currentTimeMillis()
+        )
+        viewModelScope.launch {
+            runningPostureRepository.saveMeasurement(measurement)
+            _uiState.update {
+                it.copy(
+                    runningSavedMessage = if (videoPath != null) "Video saved" else "Photo saved"
+                )
+            }
+        }
+    }
+
+    fun dismissRunningSavedDialog() {
+        _uiState.update { it.copy(runningSavedMessage = null) }
+    }
+
     fun zoomIn() {
         val current = _uiState.value.zoomRatio
         val max = _uiState.value.maxZoomRatio
@@ -1006,6 +1119,7 @@ class MeasureViewModel @Inject constructor(
         clearSizeCalibration()
         cameraManager.shutdown()
         processingCollectionJob?.cancel()
+        poseCollectionJob?.cancel()
     }
 
     private fun matToBitmap(mat: org.opencv.core.Mat): Bitmap? {

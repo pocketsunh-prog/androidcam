@@ -84,6 +84,11 @@ dependencies {
     implementation("androidx.camera:camera-camera2:$cameraxVersion")
     implementation("androidx.camera:camera-lifecycle:$cameraxVersion")
     implementation("androidx.camera:camera-view:$cameraxVersion")
+    implementation("androidx.camera:camera-video:$cameraxVersion")
+
+    // ML Kit pose detection (on-device, no Google Play Services required)
+    implementation("com.google.mlkit:pose-detection:18.0.0-beta4")
+    implementation("com.google.mlkit:pose-detection-accurate:18.0.0-beta4")
 
     // OpenCV (local Android SDK module)
     implementation(project(":opencv"))

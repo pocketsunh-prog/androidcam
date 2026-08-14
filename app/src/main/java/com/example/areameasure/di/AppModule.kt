@@ -5,9 +5,11 @@ import androidx.room.Room
 import com.example.areameasure.data.local.AppDatabase
 import com.example.areameasure.data.local.MeasurementDao
 import com.example.areameasure.data.local.PeopleCountDao
+import com.example.areameasure.data.local.RunningPostureDao
 import com.example.areameasure.data.local.SpeedDao
 import com.example.areameasure.data.repository.MeasurementRepository
 import com.example.areameasure.data.repository.PeopleCountRepository
+import com.example.areameasure.data.repository.RunningPostureRepository
 import com.example.areameasure.data.repository.SpeedRepository
 import com.example.areameasure.processing.ImageProcessor
 import dagger.Module
@@ -53,6 +55,12 @@ object AppModule {
 
     @Provides
     @Singleton
+    fun provideRunningPostureDao(database: AppDatabase): RunningPostureDao {
+        return database.runningPostureDao()
+    }
+
+    @Provides
+    @Singleton
     fun provideMeasurementRepository(dao: MeasurementDao): MeasurementRepository {
         return MeasurementRepository(dao)
     }
@@ -67,6 +75,12 @@ object AppModule {
     @Singleton
     fun providePeopleCountRepository(dao: PeopleCountDao): PeopleCountRepository {
         return PeopleCountRepository(dao)
+    }
+
+    @Provides
+    @Singleton
+    fun provideRunningPostureRepository(dao: RunningPostureDao): RunningPostureRepository {
+        return RunningPostureRepository(dao)
     }
 
     @Provides

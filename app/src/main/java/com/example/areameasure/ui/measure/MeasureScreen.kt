@@ -29,6 +29,7 @@ import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
+import androidx.compose.material.icons.automirrored.filled.DirectionsRun
 import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.CameraAlt
 import androidx.compose.material.icons.filled.DeleteSweep
@@ -40,6 +41,7 @@ import androidx.compose.material.icons.filled.RestartAlt
 import androidx.compose.material.icons.filled.Speed
 import androidx.compose.material.icons.filled.SquareFoot
 import androidx.compose.material.icons.filled.Stop
+import androidx.compose.material.icons.filled.Videocam
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
@@ -86,6 +88,7 @@ import androidx.camera.view.PreviewView
 import androidx.compose.ui.viewinterop.AndroidView
 import com.example.areameasure.data.model.UnitOfMeasure
 import com.example.areameasure.domain.MeasureMode
+import com.example.areameasure.domain.RunType
 
 // ---------------------------------------------------------------- camera preview area
 
@@ -103,11 +106,13 @@ private fun CameraPreviewArea(
     overlaySize: MutableState<IntSize>
 ) {
     val isSpeed = uiState.mode == MeasureMode.SPEED
+    val isRunning = uiState.mode == MeasureMode.RUNNING
+    val zoomEnabled = isSpeed || isRunning
     Box(
         modifier = Modifier
             .fillMaxSize()
-            .pointerInput(isSpeed) {
-                if (!isSpeed) return@pointerInput
+            .pointerInput(zoomEnabled) {
+                if (!zoomEnabled) return@pointerInput
                 detectTransformGestures { _, _, zoom, _ ->
                     if (uiState.isCameraRunning) {
                         viewModel.setZoom(uiState.zoomRatio * zoom)
@@ -156,6 +161,8 @@ private fun CameraPreviewArea(
                                     )
                                     // PEOPLE mode has no tap-to-select interaction.
                                     MeasureMode.PEOPLE -> Unit
+                                    // RUNNING has no tap-to-select interaction.
+                                    MeasureMode.RUNNING -> Unit
                                 }
                             }
                         }
@@ -174,8 +181,8 @@ private fun CameraPreviewArea(
             )
         }
 
-        // SPEED: zoom controls on the right
-        if (isSpeed && uiState.isCameraRunning) {
+        // SPEED + RUNNING: zoom controls on the right
+        if (zoomEnabled && uiState.isCameraRunning) {
             ZoomControls(
                 zoomRatio = uiState.zoomRatio,
                 maxZoomRatio = uiState.maxZoomRatio,
@@ -205,6 +212,15 @@ private fun CameraPreviewArea(
         if (uiState.mode == MeasureMode.PEOPLE && uiState.isCameraRunning) {
             PeopleOverlay(
                 count = uiState.peopleCount,
+                modifier = Modifier.align(Alignment.TopCenter)
+            )
+        }
+
+        // RUNNING: posture verdict overlay (yellow = good, red = bad).
+        if (isRunning && uiState.isCameraRunning) {
+            RunningPostureOverlay(
+                postureCorrect = uiState.postureCorrect,
+                trunkLeanDegrees = uiState.trunkLeanDegrees,
                 modifier = Modifier.align(Alignment.TopCenter)
             )
         }
@@ -298,6 +314,7 @@ private fun ModeControls(uiState: MeasureUiState, viewModel: MeasureViewModel) {
         MeasureMode.SIZE -> SizeControls(uiState = uiState, viewModel = viewModel)
         MeasureMode.SPEED -> SpeedControls(uiState = uiState, viewModel = viewModel)
         MeasureMode.PEOPLE -> PeopleControls(uiState = uiState, viewModel = viewModel)
+        MeasureMode.RUNNING -> RunningControls(uiState = uiState, viewModel = viewModel)
     }
 }
 
@@ -472,6 +489,18 @@ fun MeasureScreen(
         )
     }
 
+    // RUNNING: capture saved confirmation.
+    uiState.runningSavedMessage?.let { msg ->
+        AlertDialog(
+            onDismissRequest = { viewModel.dismissRunningSavedDialog() },
+            title = { Text("Saved") },
+            text = { Text(msg) },
+            confirmButton = {
+                TextButton(onClick = { viewModel.dismissRunningSavedDialog() }) { Text("OK") }
+            }
+        )
+    }
+
     // Clear memory confirmation
     if (showClearMemoryDialog) {
         AlertDialog(
@@ -522,7 +551,7 @@ private fun MeasureModeToggle(
             onClick = { onSelect(MeasureMode.SIZE) },
             modifier = Modifier.weight(1f)
         )
-        Spacer(modifier = Modifier.width(8.dp))
+        Spacer(modifier = Modifier.width(4.dp))
         ModeButton(
             label = "Speed",
             icon = Icons.Default.Speed,
@@ -530,12 +559,20 @@ private fun MeasureModeToggle(
             onClick = { onSelect(MeasureMode.SPEED) },
             modifier = Modifier.weight(1f)
         )
-        Spacer(modifier = Modifier.width(8.dp))
+        Spacer(modifier = Modifier.width(4.dp))
         ModeButton(
             label = "People",
             icon = Icons.Default.Person,
             selected = selected == MeasureMode.PEOPLE,
             onClick = { onSelect(MeasureMode.PEOPLE) },
+            modifier = Modifier.weight(1f)
+        )
+        Spacer(modifier = Modifier.width(4.dp))
+        ModeButton(
+            label = "Run",
+            icon = Icons.AutoMirrored.Filled.DirectionsRun,
+            selected = selected == MeasureMode.RUNNING,
+            onClick = { onSelect(MeasureMode.RUNNING) },
             modifier = Modifier.weight(1f)
         )
     }
@@ -753,6 +790,146 @@ private fun PeopleOverlay(count: Int, modifier: Modifier = Modifier) {
             style = MaterialTheme.typography.bodySmall,
             color = Color(0xFF888888)
         )
+    }
+}
+
+// ---------------------------------------------------------------- RUNNING controls
+
+@Composable
+private fun RunningControls(uiState: MeasureUiState, viewModel: MeasureViewModel) {
+    // Long-distance vs sprint selection.
+    Row(
+        modifier = Modifier.fillMaxWidth(),
+        horizontalArrangement = Arrangement.Center
+    ) {
+        RunTypeButton(
+            label = "Long",
+            selected = uiState.runType == RunType.LONG,
+            onClick = { viewModel.selectRunType(RunType.LONG) },
+            modifier = Modifier.weight(1f)
+        )
+        Spacer(modifier = Modifier.width(8.dp))
+        RunTypeButton(
+            label = "Short",
+            selected = uiState.runType == RunType.SHORT,
+            onClick = { viewModel.selectRunType(RunType.SHORT) },
+            modifier = Modifier.weight(1f)
+        )
+    }
+
+    Spacer(modifier = Modifier.height(10.dp))
+
+    // Live posture verdict.
+    val verdictText = when (uiState.postureCorrect) {
+        true -> "Good posture"
+        false -> "Bad posture"
+        null -> "No pose detected"
+    }
+    val verdictColor = when (uiState.postureCorrect) {
+        true -> Color(0xFFFFEB3B)
+        false -> Color(0xFFF44336)
+        null -> Color(0xFFAAAAAA)
+    }
+    Text(
+        text = verdictText,
+        style = MaterialTheme.typography.bodyMedium,
+        color = verdictColor,
+        fontWeight = FontWeight.Bold
+    )
+
+    Spacer(modifier = Modifier.height(10.dp))
+
+    Row(
+        modifier = Modifier.fillMaxWidth(),
+        horizontalArrangement = Arrangement.Center
+    ) {
+        Button(
+            onClick = { viewModel.captureRunningPhoto() },
+            enabled = uiState.isCameraRunning,
+            colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF4CAF50))
+        ) {
+            Icon(Icons.Default.CameraAlt, contentDescription = null, modifier = Modifier.size(18.dp))
+            Spacer(modifier = Modifier.width(6.dp))
+            Text("Photo")
+        }
+        Spacer(modifier = Modifier.width(8.dp))
+        Button(
+            onClick = {
+                if (uiState.isRecording) viewModel.stopRunningRecording()
+                else viewModel.startRunningRecording()
+            },
+            enabled = uiState.isCameraRunning,
+            colors = ButtonDefaults.buttonColors(
+                containerColor = if (uiState.isRecording) Color(0xFFF44336) else Color(0xFF2196F3)
+            )
+        ) {
+            Icon(
+                if (uiState.isRecording) Icons.Default.Stop else Icons.Default.Videocam,
+                contentDescription = null,
+                modifier = Modifier.size(18.dp)
+            )
+            Spacer(modifier = Modifier.width(6.dp))
+            Text(if (uiState.isRecording) "Stop" else "Record")
+        }
+    }
+}
+
+@Composable
+private fun RunTypeButton(
+    label: String,
+    selected: Boolean,
+    onClick: () -> Unit,
+    modifier: Modifier = Modifier
+) {
+    Button(
+        onClick = onClick,
+        modifier = modifier.height(44.dp),
+        colors = if (selected) ButtonDefaults.buttonColors()
+                 else ButtonDefaults.outlinedButtonColors(),
+        border = if (selected) null else ButtonDefaults.outlinedButtonBorder
+    ) {
+        Text(label)
+    }
+}
+
+@Composable
+private fun RunningPostureOverlay(
+    postureCorrect: Boolean?,
+    trunkLeanDegrees: Double?,
+    modifier: Modifier = Modifier
+) {
+    val (text, color) = when (postureCorrect) {
+        true -> "Good posture" to Color(0xFFFFEB3B)
+        false -> "Bad posture" to Color(0xFFF44336)
+        null -> "No pose detected" to Color(0xFFAAAAAA)
+    }
+    Column(
+        modifier = modifier
+            .fillMaxWidth()
+            .padding(12.dp)
+            .background(Color.Black.copy(alpha = 0.7f), RoundedCornerShape(12.dp))
+            .padding(12.dp),
+        horizontalAlignment = Alignment.CenterHorizontally
+    ) {
+        Icon(
+            Icons.AutoMirrored.Filled.DirectionsRun,
+            contentDescription = null,
+            tint = color,
+            modifier = Modifier.size(28.dp)
+        )
+        Text(
+            text = text,
+            style = MaterialTheme.typography.headlineMedium,
+            fontWeight = FontWeight.Bold,
+            color = color
+        )
+        if (trunkLeanDegrees != null) {
+            Text(
+                text = "Lean ${"%.0f".format(trunkLeanDegrees)}°",
+                style = MaterialTheme.typography.bodySmall,
+                color = Color.White
+            )
+        }
     }
 }
 

@@ -10,10 +10,18 @@ import androidx.camera.core.ImageCapture
 import androidx.camera.core.ImageCaptureException
 import androidx.camera.core.Preview
 import androidx.camera.lifecycle.ProcessCameraProvider
+import androidx.camera.video.FileOutputOptions
+import androidx.camera.video.Quality
+import androidx.camera.video.QualitySelector
+import androidx.camera.video.Recorder
+import androidx.camera.video.Recording
+import androidx.camera.video.VideoCapture
+import androidx.camera.video.VideoRecordEvent
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.LifecycleOwner
 import com.example.areameasure.domain.MeasureMode
 import com.example.areameasure.processing.ImageProcessor
+import com.example.areameasure.processing.PoseDetector
 import dagger.hilt.android.qualifiers.ApplicationContext
 import org.opencv.core.Rect
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -28,13 +36,8 @@ import javax.inject.Singleton
 /**
  * Manages the CameraX lifecycle for the unified measure screen.
  *
- * Supports both [MeasureMode.SIZE] (preview + analysis + image capture) and
- * [MeasureMode.SPEED] (preview + analysis only). [ImageCapture] is bound only in
- * SIZE mode — many devices only support 2 concurrent use cases, so binding it
- * during SPEED tracking avoids `takePicture()` crashes.
- *
- * Set [measureMode] before calling [startCamera]; the axis overlay is drawn only
- * in SIZE mode via the shared [ImageProcessor].
+ * SIZE/SPEED/PEOPLE use the OpenCV [CameraFrameAnalyzer]. RUNNING uses
+ * [RunningPoseAnalyzer] (ML Kit pose) plus photo and video capture.
  */
 @Singleton
 class MeasureCameraManager @Inject constructor(
@@ -43,32 +46,37 @@ class MeasureCameraManager @Inject constructor(
 ) {
     private var cameraProvider: ProcessCameraProvider? = null
     private var imageCapture: ImageCapture? = null
+    private var videoCapture: VideoCapture<Recorder>? = null
     private var imageAnalysis: ImageAnalysis? = null
     private var preview: Preview? = null
     private var camera: Camera? = null
+    private var lifecycleOwner: LifecycleOwner? = null
+
+    private var activeRecording: Recording? = null
+    private var pendingVideoCallback: ((String) -> Unit)? = null
 
     private val analyzer = CameraFrameAnalyzer(imageProcessor) { result ->
         _processingResults.value = result
     }
 
+    private val poseDetector = PoseDetector()
+    private val poseAnalyzer = RunningPoseAnalyzer(poseDetector) { result ->
+        _runningPoseResults.value = result
+    }
+
     private val _processingResults = MutableStateFlow<ImageProcessor.ProcessingResult?>(null)
     val processingResults: StateFlow<ImageProcessor.ProcessingResult?> = _processingResults.asStateFlow()
 
-    /**
-     * Single-thread executor for frame analysis (off the main thread).
-     *
-     * Kept as a (lazily recreated) `var` rather than a one-shot `val` because
-     * [shutdown] terminates the executor. Restarting the camera after a stop
-     * would otherwise submit the analyzer to a dead executor and freeze.
-     */
+    private val _runningPoseResults = MutableStateFlow<PoseDetector.Result?>(null)
+    val runningPoseResults: StateFlow<PoseDetector.Result?> = _runningPoseResults.asStateFlow()
+
     private var analysisExecutor = Executors.newSingleThreadExecutor()
 
     var measureMode: MeasureMode = MeasureMode.SIZE
 
     /**
      * Clockwise rotation (a multiple of 90°) to apply to the analysis frame so
-     * the contour overlay matches the upright, crop-filled preview. Computed from
-     * the back camera's sensor orientation vs. the current display rotation.
+     * the contour overlay matches the upright, crop-filled preview.
      */
     var overlayRotationDegrees: Int = 0
 
@@ -95,32 +103,23 @@ class MeasureCameraManager @Inject constructor(
         return try {
             val provider = ProcessCameraProvider.getInstance(context).await()
             cameraProvider = provider
+            this.lifecycleOwner = lifecycleOwner
 
-            // Recreate the executor if a prior shutdown terminated it, otherwise
-            // setAnalyzer() silently no-ops against a dead executor and the
-            // preview freezes with no frames.
+            // Recreate the executor if a prior shutdown terminated it.
             if (analysisExecutor.isShutdown) {
                 analysisExecutor = Executors.newSingleThreadExecutor()
             }
 
-            // Draw the 3D X/Y/Z axes only while measuring size.
+            val isRunning = measureMode == MeasureMode.RUNNING
+
+            // OpenCV processing flags.
             imageProcessor.drawAxes = measureMode == MeasureMode.SIZE
-
-            // Scan for faces only in PEOPLE mode. The detector is initialized
-            // once at app startup; this just toggles per-frame detection.
             imageProcessor.detectFaces = measureMode == MeasureMode.PEOPLE
-
-            // Visual target tracking (for accurate speed) runs only in SPEED mode.
             imageProcessor.speedTrackingEnabled = measureMode == MeasureMode.SPEED
-
-            // SPEED starts with nothing marked until the ViewModel reports a
-            // moving/tracked contour; other modes mark every contour.
             analyzer.setMarkedContourIndices(
                 if (measureMode == MeasureMode.SPEED) emptySet() else null
             )
 
-            // Align the preview to the display rotation so it isn't shown
-            // sideways in a portrait UI (the camera sensor is landscape).
             val displayRotation = (context.getSystemService(Context.WINDOW_SERVICE) as WindowManager)
                 .defaultDisplay.rotation
 
@@ -129,28 +128,35 @@ class MeasureCameraManager @Inject constructor(
                 .build()
                 .also { it.setSurfaceProvider(surfaceProvider) }
 
-            // Rotation the raw analysis frame needs so the contour overlay lines
-            // up with the upright preview. sensorOrientation comes from the back
-            // camera; the delta to the display rotation is what the preview applies.
             val sensorOrientation = backCameraSensorOrientation()
             overlayRotationDegrees = (sensorOrientation - rotationDegrees(displayRotation) + 360) % 360
-
-            // Analysis stays unrotated — detection coordinates must match the
-            // raw sensor frame, not the rotated preview.
 
             imageAnalysis = ImageAnalysis.Builder()
                 .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
                 .setOutputImageFormat(ImageAnalysis.OUTPUT_IMAGE_FORMAT_YUV_420_888)
                 .build()
-                .also { it.setAnalyzer(analysisExecutor, analyzer) }
 
-            // Image capture is only needed to photograph the measured object.
-            if (measureMode == MeasureMode.SIZE) {
-                imageCapture = ImageCapture.Builder()
+            if (isRunning) {
+                imageAnalysis!!.setAnalyzer(analysisExecutor, poseAnalyzer)
+            } else {
+                imageAnalysis!!.setAnalyzer(analysisExecutor, analyzer)
+            }
+
+            imageCapture = if (measureMode == MeasureMode.SIZE || isRunning) {
+                ImageCapture.Builder()
                     .setCaptureMode(ImageCapture.CAPTURE_MODE_MINIMIZE_LATENCY)
                     .build()
             } else {
-                imageCapture = null
+                null
+            }
+
+            videoCapture = if (isRunning) {
+                val recorder = Recorder.Builder()
+                    .setQualitySelector(QualitySelector.from(Quality.SD))
+                    .build()
+                VideoCapture.withOutput(recorder)
+            } else {
+                null
             }
 
             provider.unbindAll()
@@ -171,6 +177,98 @@ class MeasureCameraManager @Inject constructor(
         }
     }
 
+    /** Capture a photo without unbinding preview/analysis (RUNNING keeps 3 use cases). */
+    fun captureRunningPhoto(
+        onSaved: (String) -> Unit,
+        onError: (Exception) -> Unit
+    ) {
+        val capture = imageCapture ?: run {
+            onError(IllegalStateException("Camera not initialized"))
+            return
+        }
+        val file = File(context.filesDir, "running_${System.currentTimeMillis()}.jpg")
+        val outputOptions = ImageCapture.OutputFileOptions.Builder(file).build()
+
+        capture.takePicture(
+            outputOptions,
+            ContextCompat.getMainExecutor(context),
+            object : ImageCapture.OnImageSavedCallback {
+                override fun onImageSaved(output: ImageCapture.OutputFileResults) {
+                    onSaved(file.absolutePath)
+                }
+
+                override fun onError(exception: ImageCaptureException) {
+                    onError(exception)
+                }
+            }
+        )
+    }
+
+    /** Start recording a short running clip (rebinds analysis→video to stay ≤3 use cases). */
+    fun startRunningRecording(
+        onStarted: () -> Unit,
+        onError: (Exception) -> Unit
+    ) {
+        val vc = videoCapture ?: run {
+            onError(IllegalStateException("Video capture not available"))
+            return
+        }
+
+        try {
+            rebindForVideo(recordingActive = true)
+        } catch (e: Exception) {
+            onError(e)
+            return
+        }
+
+        val file = File(context.filesDir, "running_${System.currentTimeMillis()}.mp4")
+        val outputOptions = FileOutputOptions.Builder(file).build()
+        pendingVideoCallback = null
+
+        try {
+            val recording = vc.output.prepareRecording(context, outputOptions)
+                .start(ContextCompat.getMainExecutor(context)) { event ->
+                    if (event is VideoRecordEvent.Finalize) {
+                        activeRecording = null
+                        rebindForVideo(recordingActive = false)
+                        val cb = pendingVideoCallback
+                        pendingVideoCallback = null
+                        cb?.invoke(file.absolutePath)
+                    }
+                }
+            activeRecording = recording
+            onStarted()
+        } catch (e: Exception) {
+            rebindForVideo(recordingActive = false)
+            onError(e)
+        }
+    }
+
+    /** Stop the active recording; [onSaved] fires once the clip is finalized. */
+    fun stopRunningRecording(onSaved: (String) -> Unit) {
+        val recording = activeRecording ?: return
+        pendingVideoCallback = onSaved
+        recording.stop()
+    }
+
+    fun isRecording(): Boolean = activeRecording != null
+
+    private fun rebindForVideo(recordingActive: Boolean) {
+        val provider = cameraProvider ?: return
+        val owner = lifecycleOwner ?: return
+        provider.unbindAll()
+        val useCases = mutableListOf(preview, imageAnalysis).apply {
+            if (recordingActive) videoCapture?.let { add(it) }
+            else imageCapture?.let { add(it) }
+        }
+        camera = provider.bindToLifecycle(
+            owner,
+            CameraSelector.DEFAULT_BACK_CAMERA,
+            *useCases.toTypedArray()
+        )
+    }
+
+    /** SIZE-mode capture: unbind preview/analysis first to respect 2-use-case devices. */
     fun captureImage(
         onSaved: (String) -> Unit,
         onError: (Exception) -> Unit
@@ -180,9 +278,6 @@ class MeasureCameraManager @Inject constructor(
             return
         }
 
-        // Unbind preview and image analysis before capturing. Many devices only
-        // support 2 concurrent camera use cases; running Preview + ImageAnalysis
-        // + ImageCapture simultaneously causes a crash on takePicture().
         preview?.let { cameraProvider?.unbind(it) }
         imageAnalysis?.let { cameraProvider?.unbind(it) }
 
@@ -205,6 +300,8 @@ class MeasureCameraManager @Inject constructor(
     }
 
     fun shutdown() {
+        activeRecording?.stop()
+        activeRecording = null
         cameraProvider?.unbindAll()
         analysisExecutor.shutdown()
     }
